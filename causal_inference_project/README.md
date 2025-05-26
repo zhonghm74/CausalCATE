@@ -17,3 +17,10 @@ For a usage example, see `examples/dml_example.py`. This script demonstrates how
 - **Description:** An algorithm that learns disentangled representations of features to improve counterfactual predictions. It separates features into those influencing the outcome (`z_y`) and those influencing treatment assignment (`z_s`), minimizing mutual information between `z_s` and treatment `t` to reduce confounding.
 - **Core Implementation:** `algorithms/drcfr/`
 - **Example Usage:** `examples/drcfr_example.py`
+
+### SRCVAE (Learning Causal Effect Variational Autoencoder)
+
+- **Description:** A variational autoencoder-based model designed to estimate causal effects from observational data, particularly in scenarios with unobserved confounding and potentially unknown treatment assignment mechanisms. It models latent variables for unobserved confounders and instruments.
+- **Paper:** "Learning Causal Effect Variational Autoencoder for Handling Unobserved Confounding and Unknown Treatment Assignment" (https://arxiv.org/pdf/2109.04999)
+- **Core Implementation:** `algorithms/srcvae/`
+- **Example Usage:** `examples/srcvae_example.py`
