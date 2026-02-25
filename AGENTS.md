@@ -37,6 +37,12 @@ python3 causal_inference_project/examples/drcfr_example.py
 python3 causal_inference_project/examples/srcvae_example.py  # has a pre-existing unpacking bug
 ```
 
+### Running the Streamlit UI
+
+```bash
+streamlit run causal_inference_project/app.py --server.port 8501 --server.headless true
+```
+
 ### Gotchas
 
 - PyTorch must be installed from the CPU-only index (`https://download.pytorch.org/whl/cpu`) separately before installing other packages, because mixing `--index-url` with default PyPI causes resolution failures for non-torch packages.
