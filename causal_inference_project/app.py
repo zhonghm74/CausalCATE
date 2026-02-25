@@ -437,7 +437,7 @@ elif algo == "SRCVAE":
                 n_samples, x_dim, true_ate, int(seed)
             )
             (X_tr, X_val, T_tr, T_val,
-             Yf_tr, Yf_val, Y0_val, Y1_val) = train_test_split(
+             Yf_tr, Yf_val, Y0_tr, Y0_val, Y1_tr, Y1_val) = train_test_split(
                 X_np, T_np, Yf_np, Y0_np, Y1_np, test_size=0.2, random_state=123
             )
 
