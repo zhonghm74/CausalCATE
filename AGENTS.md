@@ -27,9 +27,7 @@ pip install scikit-learn pytest pandas
 python3 -m pytest causal_inference_project/tests/ -v
 ```
 
-**Known pre-existing test failures** (not environment issues):
-- `test_dml_binary_treatment`: statistical tolerance too tight for the simple models used
-- `test_reconstruction_bce_loss`: missing `import torch.nn.functional as F` in `test_srcvae.py`
+All 29 tests should pass.
 
 ### Running examples
 
