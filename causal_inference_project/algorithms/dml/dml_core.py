@@ -55,7 +55,10 @@ def double_ml(X, y, T, ml_model_y, ml_model_t, treatment_is_binary):
 
     # Step 2: Estimate treatment model E[T|X] and get residuals T_res = T - E[T|X]
     ml_model_t.fit(X, T)
-    t_hat = ml_model_t.predict(X)
+    if treatment_is_binary and hasattr(ml_model_t, 'predict_proba'):
+        t_hat = ml_model_t.predict_proba(X)[:, 1]
+    else:
+        t_hat = ml_model_t.predict(X)
     t_res = T - t_hat
 
     # Step 3: Estimate the causal effect by regressing y_res on t_res
