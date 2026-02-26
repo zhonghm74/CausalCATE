@@ -17,7 +17,10 @@ import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from algorithms.dml.dml_core import double_ml
+from algorithms.dml.dml_core import double_ml, double_ml_crossfit, double_ml_multi_treatment
+from algorithms.dml.dml_cate import r_learner, dr_learner
+from algorithms.dml.dml_auto import auto_dml
+from algorithms.dml.dml_iv import iv_dml, did_dml
 from algorithms.drcfr.drcfr_model import DRCFRModel
 from algorithms.srcvae.srcvae_model import SRCVAEModel
 
@@ -129,104 +132,256 @@ if algo == "Overview":
 # ============================= DML ==========================================
 elif algo == "DML":
     st.title("Double / Debiased Machine Learning (DML)")
-    st.markdown(
-        "Estimate causal effects by partialling out confounders with two "
-        "ML models and regressing the residuals."
-    )
 
-    col_cfg, col_res = st.columns([1, 2])
+    from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression, Ridge
+    from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
+                                  GradientBoostingRegressor)
 
-    with col_cfg:
-        st.subheader("Data Settings")
-        n_samples = st.slider("Samples", 200, 5000, 2000, 100, key="dml_n")
-        n_features = st.slider("Features (confounders)", 2, 20, 5, key="dml_f")
-        true_effect = st.number_input("True causal effect", value=2.5, step=0.1, key="dml_te")
-        binary = st.toggle("Binary treatment", value=True, key="dml_bin")
-        seed = st.number_input("Random seed", value=42, step=1, key="dml_seed")
+    MODEL_MAP = {
+        "LinearRegression": lambda: LinearRegression(),
+        "Lasso": lambda: Lasso(alpha=0.1, max_iter=5000),
+        "Ridge": lambda: Ridge(alpha=1.0),
+        "RandomForestRegressor": lambda: RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42),
+        "GradientBoosting": lambda: GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42),
+        "LogisticRegression": lambda: LogisticRegression(solver="liblinear", random_state=42),
+        "RandomForestClassifier": lambda: RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
+    }
 
-        st.subheader("Model Settings")
-        from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression
-        from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+    dml_tab = st.tabs([
+        "Cross-fit DML", "CATE (R/DR-Learner)", "Auto DML", "IV-DML", "DiD-DML",
+    ])
 
-        outcome_model_name = st.selectbox(
-            "Outcome model (E[Y|X])",
-            ["LinearRegression", "Lasso", "RandomForestRegressor"],
-            key="dml_ym",
-        )
-        if binary:
-            treatment_model_name = st.selectbox(
-                "Treatment model (E[T|X])",
-                ["LogisticRegression", "RandomForestClassifier"],
-                key="dml_tm",
-            )
-        else:
-            treatment_model_name = st.selectbox(
-                "Treatment model (E[T|X])",
-                ["LinearRegression", "Lasso"],
-                key="dml_tm_c",
-            )
-
-        run_dml = st.button("Run DML", type="primary", use_container_width=True)
-
-    with col_res:
-        if run_dml:
-            with st.spinner("Running DML …"):
-                X, y, T = generate_dml_data(n_samples, n_features, true_effect, binary, int(seed))
-
-                model_map = {
-                    "LinearRegression": LinearRegression(),
-                    "Lasso": Lasso(alpha=0.1),
-                    "RandomForestRegressor": RandomForestRegressor(random_state=42),
-                    "LogisticRegression": LogisticRegression(solver="liblinear", random_state=42),
-                    "RandomForestClassifier": RandomForestClassifier(random_state=42),
-                }
-                model_y = model_map[outcome_model_name]
-                model_t = model_map[treatment_model_name]
-
-                est = double_ml(X, y, T, model_y, model_t, treatment_is_binary=binary)
-
-            # -- metrics --
-            st.subheader("Results")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("True Effect", f"{true_effect:.4f}")
-            m2.metric("Estimated Effect", f"{est:.4f}")
-            m3.metric("Absolute Error", f"{abs(est - true_effect):.4f}")
-
-            # -- residual plots --
-            model_y2 = model_map[outcome_model_name].__class__(**model_map[outcome_model_name].get_params())
-            model_t2 = model_map[treatment_model_name].__class__(**model_map[treatment_model_name].get_params())
-            model_y2.fit(X, y)
-            y_res = y - model_y2.predict(X)
-            model_t2.fit(X, T)
-            if binary and hasattr(model_t2, "predict_proba"):
-                t_hat = model_t2.predict_proba(X)[:, 1]
+    # ---- Tab 1: Cross-fitted DML with inference ----
+    with dml_tab[0]:
+        st.markdown("K-fold cross-fitted DML with Neyman-orthogonal standard errors and confidence intervals.")
+        col_cfg, col_res = st.columns([1, 2])
+        with col_cfg:
+            st.subheader("Data")
+            n_samples = st.slider("Samples", 500, 5000, 2000, 100, key="cf_n")
+            n_features = st.slider("Features", 2, 20, 5, key="cf_f")
+            true_effect = st.number_input("True effect", value=2.5, step=0.1, key="cf_te")
+            binary = st.toggle("Binary treatment", True, key="cf_bin")
+            seed = st.number_input("Seed", value=42, step=1, key="cf_seed")
+            st.subheader("Settings")
+            n_folds = st.slider("K folds", 2, 10, 5, key="cf_k")
+            ym = st.selectbox("Outcome model", ["LinearRegression", "Lasso", "RandomForestRegressor", "GradientBoosting"], key="cf_ym")
+            if binary:
+                tm = st.selectbox("Treatment model", ["LogisticRegression", "RandomForestClassifier"], key="cf_tm")
             else:
-                t_hat = model_t2.predict(X)
-            t_res = T - t_hat
+                tm = st.selectbox("Treatment model", ["LinearRegression", "Lasso"], key="cf_tmc")
+            run = st.button("Run Cross-fit DML", type="primary", use_container_width=True, key="cf_run")
+        with col_res:
+            if run:
+                with st.spinner("Running …"):
+                    X, y, T = generate_dml_data(n_samples, n_features, true_effect, binary, int(seed))
+                    res = double_ml_crossfit(X, y, T, MODEL_MAP[ym](), MODEL_MAP[tm](),
+                                            treatment_is_binary=binary, n_folds=n_folds)
+                st.subheader("Results")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("True Effect", f"{true_effect:.4f}")
+                m2.metric("θ̂", f"{res.theta:.4f}")
+                m3.metric("SE", f"{res.se:.4f}")
+                m4.metric("p-value", f"{res.p_value:.4f}")
+                st.code(res.summary(), language="text")
+                # CI visualisation
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=[res.ci_lower, res.ci_upper], y=[0, 0],
+                    mode="lines", line=dict(color=C_PRIMARY, width=6), name="95% CI"))
+                fig.add_trace(go.Scatter(x=[res.theta], y=[0], mode="markers",
+                    marker=dict(color=C_SECONDARY, size=14, symbol="diamond"), name="θ̂"))
+                fig.add_vline(x=true_effect, line_dash="dash", line_color=C_SUCCESS, annotation_text="True θ")
+                fig.update_layout(height=150, template="plotly_dark", showlegend=True,
+                                  yaxis=dict(visible=False), xaxis_title="Causal Effect",
+                                  margin=dict(t=30, b=30, l=30, r=30))
+                st.plotly_chart(fig, use_container_width=True)
+                # Residual scatter
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(x=res.t_residuals, y=res.y_residuals, mode="markers",
+                    marker=dict(color=C_PRIMARY, opacity=0.35, size=3), name="Residuals"))
+                xs = np.linspace(res.t_residuals.min(), res.t_residuals.max(), 100)
+                fig2.add_trace(go.Scatter(x=xs, y=res.theta*xs, mode="lines",
+                    line=dict(color=C_SECONDARY, width=3), name=f"θ = {res.theta:.4f}"))
+                fig2.update_layout(title="Y_res vs T_res", height=350, template="plotly_dark",
+                                   xaxis_title="T_res", yaxis_title="Y_res", margin=dict(t=40,b=30))
+                st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Configure and click **Run Cross-fit DML**.")
 
-            fig = make_subplots(rows=1, cols=2,
-                                subplot_titles=("Outcome Residuals (Y_res)", "Treatment Residuals (T_res)"))
-            fig.add_trace(go.Histogram(x=y_res, nbinsx=50, marker_color=C_PRIMARY, opacity=0.8, name="Y_res"), row=1, col=1)
-            fig.add_trace(go.Histogram(x=t_res, nbinsx=50, marker_color=C_SECONDARY, opacity=0.8, name="T_res"), row=1, col=2)
-            fig.update_layout(height=350, showlegend=False,
-                              template="plotly_dark", margin=dict(t=40, b=30))
-            st.plotly_chart(fig, use_container_width=True)
+    # ---- Tab 2: CATE ----
+    with dml_tab[1]:
+        st.markdown("Estimate heterogeneous treatment effects τ(x) = E[Y(1)−Y(0) | X=x].")
+        col_cfg, col_res = st.columns([1, 2])
+        with col_cfg:
+            st.subheader("Data")
+            n_s = st.slider("Samples", 500, 5000, 2000, 100, key="cate_n")
+            n_f = st.slider("Features", 2, 20, 5, key="cate_f")
+            te = st.number_input("True effect", value=2.0, step=0.1, key="cate_te")
+            sd = st.number_input("Seed", value=42, step=1, key="cate_seed")
+            st.subheader("Method")
+            method = st.radio("CATE method", ["R-Learner", "DR-Learner"], key="cate_m")
+            final_model = st.selectbox("Final τ(x) model", ["Ridge", "RandomForestRegressor", "GradientBoosting"], key="cate_fm")
+            run_cate = st.button("Run CATE", type="primary", use_container_width=True, key="cate_run")
+        with col_res:
+            if run_cate:
+                with st.spinner("Estimating CATE …"):
+                    X, y, T = generate_dml_data(n_s, n_f, te, True, int(sd))
+                    cate_m = MODEL_MAP[final_model]()
+                    if method == "R-Learner":
+                        cres = r_learner(X, y, T, LinearRegression(),
+                                         LogisticRegression(solver='liblinear', random_state=42),
+                                         cate_m, n_folds=5)
+                    else:
+                        cres = dr_learner(X, y, T, LinearRegression(), LinearRegression(),
+                                          LogisticRegression(solver='liblinear', random_state=42),
+                                          cate_m, n_folds=5)
+                st.subheader("Results")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("ATE", f"{cres.ate:.4f}")
+                m2.metric("τ(x) std", f"{cres.tau_hat.std():.4f}")
+                m3.metric("True Effect", f"{te:.4f}")
+                fig = go.Figure()
+                fig.add_trace(go.Histogram(x=cres.tau_hat, nbinsx=50,
+                    marker_color=C_PRIMARY, opacity=0.7, name="τ̂(x)"))
+                fig.add_vline(x=te, line_dash="dash", line_color=C_SECONDARY,
+                              annotation_text=f"True θ = {te}")
+                fig.update_layout(title=f"{method}: CATE Distribution",
+                    xaxis_title="τ̂(x)", yaxis_title="Count",
+                    height=380, template="plotly_dark", margin=dict(t=40,b=30))
+                st.plotly_chart(fig, use_container_width=True)
+                if cres.pseudo_outcomes is not None:
+                    fig2 = go.Figure()
+                    fig2.add_trace(go.Histogram(x=cres.pseudo_outcomes, nbinsx=50,
+                        marker_color=C_WARNING, opacity=0.7, name="Pseudo-outcomes Γ"))
+                    fig2.update_layout(title="Doubly-Robust Pseudo-outcomes",
+                        xaxis_title="Γ", height=300, template="plotly_dark", margin=dict(t=40,b=30))
+                    st.plotly_chart(fig2, use_container_width=True)
+            else:
+                st.info("Configure and click **Run CATE**.")
 
-            fig2 = go.Figure()
-            fig2.add_trace(go.Scatter(x=t_res, y=y_res, mode="markers",
-                                      marker=dict(color=C_PRIMARY, opacity=0.4, size=4),
-                                      name="Residuals"))
-            xs = np.linspace(t_res.min(), t_res.max(), 100)
-            fig2.add_trace(go.Scatter(x=xs, y=est * xs, mode="lines",
-                                      line=dict(color=C_SECONDARY, width=3),
-                                      name=f"θ = {est:.4f}"))
-            fig2.update_layout(title="Y_res vs T_res (slope = estimated effect)",
-                               xaxis_title="T_res", yaxis_title="Y_res",
-                               height=400, template="plotly_dark",
-                               margin=dict(t=40, b=30))
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.info("Configure parameters on the left and click **Run DML**.")
+    # ---- Tab 3: Auto DML ----
+    with dml_tab[2]:
+        st.markdown("Automatically select the best nuisance models via cross-validation, then run cross-fitted DML.")
+        col_cfg, col_res = st.columns([1, 2])
+        with col_cfg:
+            st.subheader("Data")
+            n_s = st.slider("Samples", 500, 5000, 2000, 100, key="auto_n")
+            n_f = st.slider("Features", 2, 20, 5, key="auto_f")
+            te = st.number_input("True effect", value=2.5, step=0.1, key="auto_te")
+            binary = st.toggle("Binary treatment", True, key="auto_bin")
+            sd = st.number_input("Seed", value=42, step=1, key="auto_seed")
+            st.subheader("Settings")
+            cv_folds = st.slider("CV folds (selection)", 2, 5, 3, key="auto_cvk")
+            dml_folds = st.slider("DML folds", 2, 10, 5, key="auto_dk")
+            run_auto = st.button("Run Auto DML", type="primary", use_container_width=True, key="auto_run")
+        with col_res:
+            if run_auto:
+                with st.spinner("Selecting models & running DML …"):
+                    X, y, T = generate_dml_data(n_s, n_f, te, binary, int(sd))
+                    ares = auto_dml(X, y, T, treatment_is_binary=binary,
+                                    cv_folds=cv_folds, dml_folds=dml_folds)
+                st.subheader("Results")
+                st.code(ares.summary(), language="text")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("θ̂", f"{ares.dml_result.theta:.4f}")
+                m2.metric("SE", f"{ares.dml_result.se:.4f}")
+                m3.metric("True θ", f"{te:.4f}")
+                # Model comparison bar charts
+                fig = make_subplots(rows=1, cols=2, subplot_titles=("Outcome Model CV R²", "Treatment Model CV Score"))
+                names_y = list(ares.model_y_scores.keys())
+                vals_y = [ares.model_y_scores[n] for n in names_y]
+                colors_y = [C_SUCCESS if n == ares.best_model_y_name else C_PRIMARY for n in names_y]
+                fig.add_trace(go.Bar(x=names_y, y=vals_y, marker_color=colors_y, name="Outcome"), row=1, col=1)
+                names_t = list(ares.model_t_scores.keys())
+                vals_t = [ares.model_t_scores[n] for n in names_t]
+                colors_t = [C_SUCCESS if n == ares.best_model_t_name else C_SECONDARY for n in names_t]
+                fig.add_trace(go.Bar(x=names_t, y=vals_t, marker_color=colors_t, name="Treatment"), row=1, col=2)
+                fig.update_layout(height=350, template="plotly_dark", showlegend=False, margin=dict(t=40,b=80))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Configure and click **Run Auto DML**.")
+
+    # ---- Tab 4: IV-DML ----
+    with dml_tab[3]:
+        st.markdown("DML with instrumental variables for Local Average Treatment Effect (LATE) when unconfoundedness fails.")
+        col_cfg, col_res = st.columns([1, 2])
+        with col_cfg:
+            st.subheader("Data (synthetic IV)")
+            n_s = st.slider("Samples", 500, 8000, 3000, 100, key="iv_n")
+            late = st.number_input("True LATE", value=3.0, step=0.1, key="iv_late")
+            sd = st.number_input("Seed", value=42, step=1, key="iv_seed")
+            n_folds = st.slider("K folds", 2, 10, 5, key="iv_k")
+            run_iv = st.button("Run IV-DML", type="primary", use_container_width=True, key="iv_run")
+        with col_res:
+            if run_iv:
+                with st.spinner("Running IV-DML …"):
+                    np.random.seed(int(sd))
+                    X = np.random.randn(n_s, 3)
+                    U = np.random.randn(n_s)
+                    Z = (np.random.rand(n_s) > 0.5).astype(float)
+                    T = (0.5*X[:,0] + 1.5*Z + 0.5*U + np.random.normal(0,0.3,n_s) > 1).astype(float)
+                    y = X[:,1] + late*T + U + np.random.normal(0,0.3,n_s)
+                    ivres = iv_dml(X, y, T, Z, LinearRegression(),
+                                   LogisticRegression(solver='liblinear', random_state=42),
+                                   LogisticRegression(solver='liblinear', random_state=42),
+                                   n_folds=n_folds)
+                st.subheader("Results")
+                st.code(ivres.summary(), language="text")
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("True LATE", f"{late:.4f}")
+                m2.metric("θ̂", f"{ivres.theta:.4f}")
+                m3.metric("SE", f"{ivres.se:.4f}")
+                m4.metric("1st-stage F", f"{ivres.first_stage_f_stat:.1f}")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=[ivres.ci_lower, ivres.ci_upper], y=[0,0],
+                    mode="lines", line=dict(color=C_PRIMARY, width=6), name="95% CI"))
+                fig.add_trace(go.Scatter(x=[ivres.theta], y=[0], mode="markers",
+                    marker=dict(color=C_SECONDARY, size=14, symbol="diamond"), name="θ̂"))
+                fig.add_vline(x=late, line_dash="dash", line_color=C_SUCCESS, annotation_text="True LATE")
+                fig.update_layout(height=150, template="plotly_dark",
+                    yaxis=dict(visible=False), xaxis_title="LATE", margin=dict(t=30,b=30))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Configure and click **Run IV-DML**.")
+
+    # ---- Tab 5: DiD-DML ----
+    with dml_tab[4]:
+        st.markdown("Difference-in-Differences DML for panel data under conditional parallel trends.")
+        col_cfg, col_res = st.columns([1, 2])
+        with col_cfg:
+            st.subheader("Data (synthetic DiD)")
+            n_s = st.slider("Samples", 500, 5000, 2000, 100, key="did_n")
+            att = st.number_input("True ATT", value=2.0, step=0.1, key="did_att")
+            sd = st.number_input("Seed", value=42, step=1, key="did_seed")
+            n_folds = st.slider("K folds", 2, 10, 5, key="did_k")
+            run_did = st.button("Run DiD-DML", type="primary", use_container_width=True, key="did_run")
+        with col_res:
+            if run_did:
+                with st.spinner("Running DiD-DML …"):
+                    np.random.seed(int(sd))
+                    X = np.random.randn(n_s, 3)
+                    T = (X[:,0] + np.random.normal(0,0.5,n_s) > 0).astype(float)
+                    y_pre = X[:,1] + np.random.normal(0, 0.2, n_s)
+                    y_post = y_pre + 0.5 + att*T + np.random.normal(0, 0.2, n_s)
+                    dres = did_dml(X, y_pre, y_post, T, LinearRegression(),
+                                   LogisticRegression(solver='liblinear', random_state=42),
+                                   n_folds=n_folds)
+                st.subheader("Results")
+                st.code(dres.summary(), language="text")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("True ATT", f"{att:.4f}")
+                m2.metric("θ̂", f"{dres.theta:.4f}")
+                m3.metric("SE", f"{dres.se:.4f}")
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=[dres.ci_lower, dres.ci_upper], y=[0,0],
+                    mode="lines", line=dict(color=C_PRIMARY, width=6), name="95% CI"))
+                fig.add_trace(go.Scatter(x=[dres.theta], y=[0], mode="markers",
+                    marker=dict(color=C_SECONDARY, size=14, symbol="diamond"), name="θ̂"))
+                fig.add_vline(x=att, line_dash="dash", line_color=C_SUCCESS, annotation_text="True ATT")
+                fig.update_layout(height=150, template="plotly_dark",
+                    yaxis=dict(visible=False), xaxis_title="ATT", margin=dict(t=30,b=30))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Configure and click **Run DiD-DML**.")
 
 # ============================= DRCFR ========================================
 elif algo == "MIM-DRCFR":
