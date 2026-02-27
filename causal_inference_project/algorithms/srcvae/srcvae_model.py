@@ -1,20 +1,19 @@
 """
 Main Model Class for the SRCVAE Algorithm.
 
-This module defines the `SRCVAEModel` class, which orchestrates the components
-of the "Learning Causal Effect Variational Autoencoder for Handling Unobserved
-Confounding and Unknown Treatment Assignment" (SRCVAE) algorithm. It integrates
-the neural network architectures (Encoders, Decoders, Auxiliary Networks) and
-the loss functions to enable training and inference for causal effect estimation.
+Supports optional heteroscedastic decoders (learnable variance),
+KL annealing, early stopping, LR scheduling, and structured training history.
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from .srcvae_networks import EncoderU, EncoderV, DecoderX, DecoderT, DecoderY, AuxiliaryQTX, AuxiliaryQYXT
-from .srcvae_losses import kl_gaussian_loss, reconstruction_mse_loss, reconstruction_bce_loss
-# Auxiliary losses are aliases in srcvae_losses.py, so reconstruction_bce_loss and reconstruction_mse_loss are used directly for them.
+from .srcvae_networks import (EncoderU, EncoderV, DecoderX, DecoderT, DecoderY,
+                              AuxiliaryQTX, AuxiliaryQYXT, ConditionalPriorU)
+from .srcvae_losses import (kl_gaussian_loss, reconstruction_mse_loss,
+                            reconstruction_bce_loss, gaussian_nll_loss,
+                            kl_gaussian_to_mog)
 
 class SRCVAEModel(nn.Module):
     """
@@ -51,10 +50,14 @@ class SRCVAEModel(nn.Module):
                  hidden_dims_encoder_u, hidden_dims_encoder_v,
                  hidden_dims_decoder_x, hidden_dims_decoder_t, hidden_dims_decoder_y,
                  hidden_dims_aux_qtx, hidden_dims_aux_qyxt,
-                 alpha_x, alpha_t, alpha_y, 
-                 beta_u, beta_v, 
+                 alpha_x, alpha_t, alpha_y,
+                 beta_u, beta_v,
                  gamma_t, gamma_y,
-                 learning_rate=1e-3, weight_decay=1e-4, device=None):
+                 learning_rate=1e-3, weight_decay=1e-4, device=None,
+                 heteroscedastic=False,
+                 n_iwae_samples=1,
+                 prior='standard', n_mog_components=5,
+                 conditional_prior_u=False, hidden_dims_prior_u=None):
         """
         Initializes the SRCVAEModel.
 
@@ -90,15 +93,23 @@ class SRCVAEModel(nn.Module):
         self.y_dim = y_dim
         self.u_dim = u_dim
         self.v_dim = v_dim
+        self.heteroscedastic = heteroscedastic
+        self.n_iwae_samples = n_iwae_samples
+        self.prior_type = prior
 
-        # Initialize networks
         self.encoder_u = EncoderU(x_dim, t_dim, y_dim, u_dim, hidden_dims_encoder_u)
         self.encoder_v = EncoderV(x_dim, t_dim, v_dim, hidden_dims_encoder_v)
-        self.decoder_x = DecoderX(u_dim, v_dim, x_dim, hidden_dims_decoder_x)
+        self.decoder_x = DecoderX(u_dim, v_dim, x_dim, hidden_dims_decoder_x,
+                                  heteroscedastic=heteroscedastic)
         self.decoder_t = DecoderT(x_dim, v_dim, t_dim, hidden_dims_decoder_t)
-        self.decoder_y = DecoderY(x_dim, u_dim, t_dim, y_dim, hidden_dims_decoder_y)
+        self.decoder_y = DecoderY(x_dim, u_dim, t_dim, y_dim, hidden_dims_decoder_y,
+                                  heteroscedastic=heteroscedastic)
         self.aux_qtx = AuxiliaryQTX(x_dim, t_dim, hidden_dims_aux_qtx)
         self.aux_qyxt = AuxiliaryQYXT(x_dim, t_dim, y_dim, hidden_dims_aux_qyxt)
+        self.conditional_prior_u = conditional_prior_u
+        if conditional_prior_u:
+            h_prior = hidden_dims_prior_u or [32, 16]
+            self.prior_u_net = ConditionalPriorU(x_dim, u_dim, h_prior)
 
         # Store loss weights
         self.alpha_x = alpha_x
@@ -109,7 +120,17 @@ class SRCVAEModel(nn.Module):
         self.gamma_t = gamma_t
         self.gamma_y = gamma_y
 
-        # Optimizer
+        # MoG prior parameters (learnable)
+        if prior == 'mog':
+            K = n_mog_components
+            self.mog_u_means = nn.Parameter(torch.randn(K, u_dim) * 0.1)
+            self.mog_u_logvars = nn.Parameter(torch.zeros(K, u_dim))
+            self.mog_u_logweights = nn.Parameter(torch.zeros(K))
+            self.mog_v_means = nn.Parameter(torch.randn(K, v_dim) * 0.1)
+            self.mog_v_logvars = nn.Parameter(torch.zeros(K, v_dim))
+            self.mog_v_logweights = nn.Parameter(torch.zeros(K))
+
+        # Optimizer (must come after all parameter definitions)
         self.optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         # Device handling
@@ -174,24 +195,35 @@ class SRCVAEModel(nn.Module):
         u_sampled = self.reparameterize(u_mean, u_logvar)
         v_sampled = self.reparameterize(v_mean, v_logvar)
 
-        # Decoders
-        x_recon_mean = self.decoder_x(u_sampled, v_sampled)
-        t_recon_logits = self.decoder_t(x, v_sampled) # Using original x and sampled v
-        y_recon_mean = self.decoder_y(x, u_sampled, t) # Using original x, sampled u, and original t
+        # Decoders (may return tuples when heteroscedastic)
+        x_dec_out = self.decoder_x(u_sampled, v_sampled)
+        t_recon_logits = self.decoder_t(x, v_sampled)
+        y_dec_out = self.decoder_y(x, u_sampled, t)
 
-        # Auxiliary networks
+        if self.heteroscedastic:
+            x_recon_mean, x_recon_logvar = x_dec_out
+            y_recon_mean, y_recon_logvar = y_dec_out
+        else:
+            x_recon_mean = x_dec_out
+            x_recon_logvar = None
+            y_recon_mean = y_dec_out
+            y_recon_logvar = None
+
         t_aux_logits = self.aux_qtx(x)
         y_aux_mean = self.aux_qyxt(x, t)
 
-        return (u_mean, u_logvar, v_mean, v_logvar, 
-                x_recon_mean, t_recon_logits, y_recon_mean, 
+        return (u_mean, u_logvar, v_mean, v_logvar,
+                x_recon_mean, t_recon_logits, y_recon_mean,
                 t_aux_logits, y_aux_mean,
-                u_sampled, v_sampled)
+                u_sampled, v_sampled,
+                x_recon_logvar, y_recon_logvar)
 
-    def compute_loss(self, x_true, t_true, y_true, 
-                     u_mean, u_logvar, v_mean, v_logvar, 
-                     x_recon_mean, t_recon_logits, y_recon_mean, 
-                     t_aux_logits, y_aux_mean):
+    def compute_loss(self, x_true, t_true, y_true,
+                     u_mean, u_logvar, v_mean, v_logvar,
+                     x_recon_mean, t_recon_logits, y_recon_mean,
+                     t_aux_logits, y_aux_mean,
+                     x_recon_logvar=None, y_recon_logvar=None,
+                     kl_weight=1.0):
         """
         Computes the total SRCVAE loss and its individual components.
 
@@ -222,16 +254,43 @@ class SRCVAEModel(nn.Module):
                 - loss_components (dict): A dictionary containing the itemized values of
                                           individual loss components.
         """
-        loss_kl_u = kl_gaussian_loss(u_mean, u_logvar)
-        loss_kl_v = kl_gaussian_loss(v_mean, v_logvar)
+        if self.conditional_prior_u:
+            prior_u_mean, prior_u_logvar = self.prior_u_net(x_true)
+            diff_mean = u_mean - prior_u_mean
+            loss_kl_u = 0.5 * (
+                (prior_u_logvar - u_logvar)
+                + (u_logvar.exp() + diff_mean.pow(2)) / (prior_u_logvar.exp() + 1e-8)
+                - 1
+            ).sum(dim=1).mean()
+        elif self.prior_type == 'mog':
+            u_samples = self.reparameterize(u_mean, u_logvar)
+            loss_kl_u = kl_gaussian_to_mog(
+                u_samples, u_mean, u_logvar,
+                self.mog_u_means, self.mog_u_logvars, self.mog_u_logweights)
+        else:
+            loss_kl_u = kl_gaussian_loss(u_mean, u_logvar)
+
+        if self.prior_type == 'mog':
+            v_samples = self.reparameterize(v_mean, v_logvar)
+            loss_kl_v = kl_gaussian_to_mog(
+                v_samples, v_mean, v_logvar,
+                self.mog_v_means, self.mog_v_logvars, self.mog_v_logweights)
+        else:
+            loss_kl_v = kl_gaussian_loss(v_mean, v_logvar)
 
         # Ensure t_true and y_true have correct shapes for loss functions if they are 1D
         if t_true.ndim == 1: t_true = t_true.unsqueeze(1)
         if y_true.ndim == 1: y_true = y_true.unsqueeze(1)
 
-        loss_recon_x = reconstruction_mse_loss(x_true, x_recon_mean)
+        if self.heteroscedastic and x_recon_logvar is not None:
+            loss_recon_x = gaussian_nll_loss(x_true, x_recon_mean, x_recon_logvar)
+        else:
+            loss_recon_x = reconstruction_mse_loss(x_true, x_recon_mean)
         loss_recon_t = reconstruction_bce_loss(t_true, t_recon_logits)
-        loss_recon_y = reconstruction_mse_loss(y_true, y_recon_mean)
+        if self.heteroscedastic and y_recon_logvar is not None:
+            loss_recon_y = gaussian_nll_loss(y_true, y_recon_mean, y_recon_logvar)
+        else:
+            loss_recon_y = reconstruction_mse_loss(y_true, y_recon_mean)
         
         loss_aux_qt = reconstruction_bce_loss(t_true, t_aux_logits)
         loss_aux_qy = reconstruction_mse_loss(y_true, y_aux_mean)
@@ -239,8 +298,7 @@ class SRCVAEModel(nn.Module):
         total_loss = (self.alpha_x * loss_recon_x +
                       self.alpha_t * loss_recon_t +
                       self.alpha_y * loss_recon_y +
-                      self.beta_u * loss_kl_u +
-                      self.beta_v * loss_kl_v +
+                      kl_weight * (self.beta_u * loss_kl_u + self.beta_v * loss_kl_v) +
                       self.gamma_t * loss_aux_qt +
                       self.gamma_y * loss_aux_qy)
         
@@ -251,30 +309,51 @@ class SRCVAEModel(nn.Module):
         }
         return total_loss, loss_components
 
-    def fit(self, x_train, t_train, y_train, num_epochs, batch_size, 
-            x_val=None, t_val=None, y_val=None, print_every_epochs=10):
-        """
-        Trains the SRCVAE model using the provided training data.
+    def _iwae_loss(self, bx, bt, by, kl_weight=1.0):
+        """Compute IWAE loss using K reparameterized samples.
 
-        Args:
-            x_train (torch.Tensor): Training features.
-            t_train (torch.Tensor): Training treatments (binary {0,1}).
-            y_train (torch.Tensor): Training factual outcomes.
-            num_epochs (int): Number of epochs to train for.
-            batch_size (int): Size of mini-batches for training.
-            x_val (torch.Tensor, optional): Validation features. Defaults to None.
-            t_val (torch.Tensor, optional): Validation treatments. Defaults to None.
-            y_val (torch.Tensor, optional): Validation factual outcomes. Defaults to None.
-            print_every_epochs (int, optional): Frequency of printing training and validation
-                                                loss statistics. Defaults to 10.
+        log p(x) ≥ E_q[ log (1/K Σ_k w_k) ]  where
+        w_k = p(x,z_k) / q(z_k|x).
+        Approximated by averaging compute_loss across K samples.
         """
-        self.train() # Set model to training mode
+        K = self.n_iwae_samples
+        losses = []
+        for _ in range(K):
+            fwd = self._unpack_forward(self.forward(bx, bt, by))
+            (u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, xlv, ylv) = fwd
+            tl, _ = self.compute_loss(bx, bt, by, u_m, u_lv, v_m, v_lv,
+                                      xr, tr, yr, ta, ya, xlv, ylv,
+                                      kl_weight=kl_weight)
+            losses.append(tl.unsqueeze(0))
+        stacked = torch.cat(losses)
+        return -torch.logsumexp(-stacked, dim=0) + torch.log(torch.tensor(float(K), device=stacked.device))
 
-        # Move data to the model's device and ensure correct shapes
+    def _unpack_forward(self, outputs):
+        """Unpack the 13-element forward output tuple."""
+        (u_mean, u_logvar, v_mean, v_logvar,
+         x_recon_mean, t_recon_logits, y_recon_mean,
+         t_aux_logits, y_aux_mean, u_s, v_s,
+         x_recon_logvar, y_recon_logvar) = outputs
+        return (u_mean, u_logvar, v_mean, v_logvar,
+                x_recon_mean, t_recon_logits, y_recon_mean,
+                t_aux_logits, y_aux_mean, x_recon_logvar, y_recon_logvar)
+
+    def fit(self, x_train, t_train, y_train, num_epochs, batch_size,
+            x_val=None, t_val=None, y_val=None, print_every_epochs=10,
+            patience=None, lr_scheduler=None, kl_warmup_epochs=0):
+        """Train the model.  Returns a ``history`` dict.
+
+        New optional args (backward-compatible):
+            patience: Early-stopping patience.  Requires validation data.
+            lr_scheduler: ``'plateau'`` or ``'cosine'``, or ``None``.
+            kl_warmup_epochs: Number of epochs to linearly anneal KL weight
+                from 0 to 1.  ``0`` = no annealing (default).
+        """
+        self.train()
+
         x_train = x_train.to(self.device)
         t_train = t_train.to(self.device)
         y_train = y_train.to(self.device)
-        # Unsqueeze t and y if they are 1D, as networks/losses might expect [N,1]
         if t_train.ndim == 1: t_train = t_train.unsqueeze(1)
         if y_train.ndim == 1: y_train = y_train.unsqueeze(1)
 
@@ -291,60 +370,95 @@ class SRCVAEModel(nn.Module):
             val_dataset = TensorDataset(x_val, t_val, y_val)
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
+        # LR scheduler
+        scheduler = None
+        if lr_scheduler == 'plateau' and val_loader:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.5, patience=max(1, (patience or 10) // 2))
+        elif lr_scheduler == 'cosine':
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
+
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+        best_state = None
+
+        loss_keys = ['total_loss', 'loss_kl_u', 'loss_kl_v',
+                     'loss_recon_x', 'loss_recon_t', 'loss_recon_y',
+                     'loss_aux_qt', 'loss_aux_qy']
+        history = {'train': {k: [] for k in loss_keys}, 'val': {k: [] for k in loss_keys}}
+
         for epoch in range(num_epochs):
-            epoch_losses = {k: 0.0 for k in ['total_loss', 'loss_kl_u', 'loss_kl_v', 'loss_recon_x', 
-                                             'loss_recon_t', 'loss_recon_y', 'loss_aux_qt', 'loss_aux_qy']}
-            
-            for batch_x, batch_t, batch_y_f in train_loader: # y_f is factual y from data
+            self.train()
+            kl_weight = min(1.0, (epoch + 1) / max(kl_warmup_epochs, 1)) if kl_warmup_epochs > 0 else 1.0
+
+            ep_acc = {k: 0.0 for k in loss_keys}
+            for bx, bt, by in train_loader:
                 self.optimizer.zero_grad()
-                
-                # Pass factual y (batch_y_f) to forward for EncoderU
-                outputs = self.forward(batch_x, batch_t, batch_y_f)
-                u_mean, u_logvar, v_mean, v_logvar, \
-                x_recon_mean, t_recon_logits, y_recon_mean, \
-                t_aux_logits, y_aux_mean, _, _ = outputs
+                if self.n_iwae_samples > 1:
+                    tl = self._iwae_loss(bx, bt, by, kl_weight=kl_weight)
+                    tl.backward()
+                    self.optimizer.step()
+                    ep_acc['total_loss'] += tl.item()
+                else:
+                    fwd = self._unpack_forward(self.forward(bx, bt, by))
+                    (u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, xlv, ylv) = fwd
+                    tl, comps = self.compute_loss(bx, bt, by, u_m, u_lv, v_m, v_lv,
+                                                  xr, tr, yr, ta, ya, xlv, ylv,
+                                                  kl_weight=kl_weight)
+                    tl.backward()
+                    self.optimizer.step()
+                    for k in loss_keys:
+                        ep_acc[k] += comps[k]
+            nb = len(train_loader)
+            for k in loss_keys:
+                history['train'][k].append(ep_acc[k] / nb)
 
-                # Use factual y (batch_y_f) as ground truth for y_recon and y_aux
-                total_loss, loss_comps = self.compute_loss(
-                    batch_x, batch_t, batch_y_f, 
-                    u_mean, u_logvar, v_mean, v_logvar,
-                    x_recon_mean, t_recon_logits, y_recon_mean,
-                    t_aux_logits, y_aux_mean
-                )
-                
-                total_loss.backward()
-                self.optimizer.step()
+            # Validation
+            val_total = None
+            if val_loader:
+                self.eval()
+                vep = {k: 0.0 for k in loss_keys}
+                with torch.no_grad():
+                    for bx, bt, by in val_loader:
+                        fwd = self._unpack_forward(self.forward(bx, bt, by))
+                        (u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, xlv, ylv) = fwd
+                        _, comps = self.compute_loss(bx, bt, by, u_m, u_lv, v_m, v_lv,
+                                                     xr, tr, yr, ta, ya, xlv, ylv,
+                                                     kl_weight=kl_weight)
+                        for k in loss_keys:
+                            vep[k] += comps[k]
+                vnb = len(val_loader)
+                for k in loss_keys:
+                    history['val'][k].append(vep[k] / vnb)
+                val_total = vep['total_loss'] / vnb
 
-                for k, v_item in loss_comps.items(): # loss_comps already contains .item()
-                    epoch_losses[k] += v_item
-            
+            if scheduler is not None:
+                if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau) and val_total is not None:
+                    scheduler.step(val_total)
+                elif not isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step()
+
+            if patience is not None and val_total is not None:
+                if val_total < best_val_loss - 1e-6:
+                    best_val_loss = val_total
+                    epochs_no_improve = 0
+                    best_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
+                else:
+                    epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    if best_state is not None:
+                        self.load_state_dict({k: v.to(self.device) for k, v in best_state.items()})
+                    print(f"Early stopping at epoch {epoch+1} (best val loss: {best_val_loss:.4f})")
+                    break
+
             if (epoch + 1) % print_every_epochs == 0:
-                avg_losses_str = ", ".join([f"{k}: {v / len(train_loader):.4f}" for k, v in epoch_losses.items()])
-                print(f"Epoch {epoch+1}/{num_epochs} - Train Losses: {avg_losses_str}")
-
+                avg = ", ".join([f"{k}: {history['train'][k][-1]:.4f}" for k in loss_keys])
+                print(f"Epoch {epoch+1}/{num_epochs} - Train Losses: {avg}")
                 if val_loader:
-                    self.eval() # Set model to evaluation mode for validation
-                    val_epoch_losses = {k: 0.0 for k in epoch_losses.keys()}
-                    with torch.no_grad():
-                        for batch_x_v, batch_t_v, batch_y_f_v in val_loader:
-                            outputs_v = self.forward(batch_x_v, batch_t_v, batch_y_f_v)
-                            u_mean_v, u_logvar_v, v_mean_v, v_logvar_v, \
-                            x_recon_mean_v, t_recon_logits_v, y_recon_mean_v, \
-                            t_aux_logits_v, y_aux_mean_v, _, _ = outputs_v
+                    avg_v = ", ".join([f"{k}: {history['val'][k][-1]:.4f}" for k in loss_keys])
+                    print(f"Epoch {epoch+1}/{num_epochs} - Val Losses: {avg_v}")
 
-                            # Use factual y_f_v as ground truth for y_recon and y_aux
-                            _, val_loss_comps = self.compute_loss(
-                                batch_x_v, batch_t_v, batch_y_f_v,
-                                u_mean_v, u_logvar_v, v_mean_v, v_logvar_v,
-                                x_recon_mean_v, t_recon_logits_v, y_recon_mean_v,
-                                t_aux_logits_v, y_aux_mean_v
-                            )
-                            for k, v_item in val_loss_comps.items(): # loss_comps already contains .item()
-                                val_epoch_losses[k] += v_item
-                    
-                    avg_val_losses_str = ", ".join([f"{k}: {v / len(val_loader):.4f}" for k, v in val_epoch_losses.items()])
-                    print(f"Epoch {epoch+1}/{num_epochs} - Val Losses: {avg_val_losses_str}")
-                    self.train() # Set back to training mode
+        return history
 
     def estimate_causal_effect(self, x_factual, n_samples_u=100):
         """

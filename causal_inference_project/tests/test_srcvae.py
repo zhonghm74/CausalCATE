@@ -181,9 +181,10 @@ def test_srcvae_model_forward_pass(initialized_model, dummy_srcvae_data, default
     
     # Ensure y_f is also passed to model.forward as per SRCVAEModel definition
     outputs = initialized_model.forward(x, t, y_f)
-    u_mean, u_logvar, v_mean, v_logvar, \
-    x_recon_mean, t_recon_logits, y_recon_mean, \
-    t_aux_logits, y_aux_mean, u_sampled, v_sampled = outputs
+    (u_mean, u_logvar, v_mean, v_logvar,
+     x_recon_mean, t_recon_logits, y_recon_mean,
+     t_aux_logits, y_aux_mean, u_sampled, v_sampled,
+     x_recon_logvar, y_recon_logvar) = outputs
     
     n_samples = x.shape[0]
     assert u_mean.shape == (n_samples, params['u_dim'])
@@ -197,21 +198,24 @@ def test_srcvae_model_forward_pass(initialized_model, dummy_srcvae_data, default
     assert y_aux_mean.shape == (n_samples, params['y_dim'])
     assert u_sampled.shape == (n_samples, params['u_dim'])
     assert v_sampled.shape == (n_samples, params['v_dim'])
+    assert x_recon_logvar is None
+    assert y_recon_logvar is None
 
 
 def test_srcvae_model_compute_loss(initialized_model, dummy_srcvae_data):
     x, t, y_f = dummy_srcvae_data # y_f is factual y
     
     outputs = initialized_model.forward(x, t, y_f)
-    u_mean, u_logvar, v_mean, v_logvar, \
-    x_recon_mean, t_recon_logits, y_recon_mean, \
-    t_aux_logits, y_aux_mean, _, _ = outputs
+    (u_mean, u_logvar, v_mean, v_logvar,
+     x_recon_mean, t_recon_logits, y_recon_mean,
+     t_aux_logits, y_aux_mean, _, _,
+     x_recon_logvar, y_recon_logvar) = outputs
 
     total_loss, loss_components = initialized_model.compute_loss(
-        x, t, y_f, # Ground truth x, t, y_f
+        x, t, y_f,
         u_mean, u_logvar, v_mean, v_logvar,
         x_recon_mean, t_recon_logits, y_recon_mean,
-        t_aux_logits, y_aux_mean
+        t_aux_logits, y_aux_mean,
     )
     assert total_loss.ndim == 0
     assert isinstance(loss_components, dict)

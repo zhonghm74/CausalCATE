@@ -135,25 +135,66 @@ def mmd_loss(x1, x2, sigmas):
     return total_mmd_sq / len(sigmas) # Average MMD^2 over sigmas
 
 
-def ipm_loss_zy(z_y_treated, z_y_control, sigmas):
-    """
-    Calculates the Integral Probability Metric (IPM) loss (L_IPM in the MIM-DRCFR paper)
-    between the latent representations z_y of the treated and control groups.
+def _cost_matrix(x1, x2):
+    """Squared Euclidean cost matrix C_ij = ||x1_i - x2_j||^2."""
+    x1_sq = x1.pow(2).sum(dim=1, keepdim=True)
+    x2_sq = x2.pow(2).sum(dim=1, keepdim=True)
+    return x1_sq + x2_sq.t() - 2 * torch.mm(x1, x2.t())
 
-    This loss aims to balance the distributions of z_y for the treated and control
-    groups, i.e., P(z_y|t=1) and P(z_y|t=0). It is implemented using MMD.
+
+def sinkhorn_loss(x1, x2, epsilon=0.1, n_iters=50):
+    """Sinkhorn divergence – a smoothed Wasserstein-2 distance.
+
+    Uses the entropic-regularised OT formulation with symmetric
+    debiasing:  S(P,Q) = OT_ε(P,Q) − ½ OT_ε(P,P) − ½ OT_ε(Q,Q).
 
     Args:
-        z_y_treated (torch.Tensor): Latent variable z_y for the treated group.
-                                    Shape: (n_treated, dim_zy).
-        z_y_control (torch.Tensor): Latent variable z_y for the control group.
-                                    Shape: (n_control, dim_zy).
-        sigmas (list of float): List of RBF kernel bandwidths for the MMD calculation.
+        x1: Samples from P, shape (n1, d).
+        x2: Samples from Q, shape (n2, d).
+        epsilon: Entropic regularisation strength (smaller → closer
+            to true Wasserstein but slower convergence).
+        n_iters: Number of Sinkhorn iterations.
 
     Returns:
-        torch.Tensor: The IPM loss (a scalar), which is the MMD^2 between
-                      z_y_treated and z_y_control.
+        Scalar Sinkhorn divergence (≥ 0).
     """
+    if x1.numel() == 0 or x2.numel() == 0:
+        return torch.tensor(0.0, device=x1.device, dtype=x1.dtype)
+
+    def _ot(a, b):
+        C = _cost_matrix(a, b)
+        K = (-C / epsilon).exp()
+        n_a, n_b = a.shape[0], b.shape[0]
+        mu = torch.full((n_a,), 1.0 / n_a, device=a.device, dtype=a.dtype)
+        nu = torch.full((n_b,), 1.0 / n_b, device=a.device, dtype=a.dtype)
+        u = torch.ones_like(mu)
+        for _ in range(n_iters):
+            v = nu / (K.t() @ u + 1e-8)
+            u = mu / (K @ v + 1e-8)
+        transport = u.unsqueeze(1) * K * v.unsqueeze(0)
+        return (transport * C).sum()
+
+    ot_pq = _ot(x1, x2)
+    ot_pp = _ot(x1, x1)
+    ot_qq = _ot(x2, x2)
+    return torch.clamp(ot_pq - 0.5 * ot_pp - 0.5 * ot_qq, min=0.0)
+
+
+def ipm_loss_zy(z_y_treated, z_y_control, sigmas, method='mmd', sinkhorn_eps=0.1):
+    """IPM loss between treated and control z_y distributions.
+
+    Args:
+        z_y_treated: z_y for treated group (n_t, dim).
+        z_y_control: z_y for control group (n_c, dim).
+        sigmas: RBF bandwidths (used only when method='mmd').
+        method: ``'mmd'`` (default) or ``'sinkhorn'``.
+        sinkhorn_eps: Entropic regularisation for Sinkhorn.
+
+    Returns:
+        Scalar IPM loss.
+    """
+    if method == 'sinkhorn':
+        return sinkhorn_loss(z_y_treated, z_y_control, epsilon=sinkhorn_eps)
     return mmd_loss(z_y_treated, z_y_control, sigmas)
 
 

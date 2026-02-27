@@ -168,47 +168,20 @@ class EncoderV(nn.Module):
         return v_mean, v_logvar
 
 class DecoderX(nn.Module):
-    """
-    Decoder for observed covariates x: p_theta_x(x | u, v).
+    """Decoder p_theta_x(x | u, v).  Optionally heteroscedastic (learns variance)."""
 
-    This network reconstructs x from latent variables u and v.
-    It assumes x is continuous and outputs the mean of a Gaussian distribution.
-
-    Attributes:
-        mlp (nn.Sequential): The MLP layers for decoding.
-    """
-    def __init__(self, u_dim, v_dim, x_dim, hidden_dims):
-        """
-        Initializes the DecoderX network.
-
-        Args:
-            u_dim (int): Dimensionality of latent variable u.
-            v_dim (int): Dimensionality of latent variable v.
-            x_dim (int): Dimensionality of the observed covariates x.
-            hidden_dims (list of int): List of hidden layer sizes for the MLP.
-        """
+    def __init__(self, u_dim, v_dim, x_dim, hidden_dims, heteroscedastic=False):
         super().__init__()
-        self.mlp = _build_mlp(
-            input_dim=u_dim + v_dim,
-            output_dim=x_dim, # Outputting x_mean
-            hidden_dims=hidden_dims,
-            activation=nn.ELU(),
-            output_activation=None # Linear output for mean
-        )
+        self.heteroscedastic = heteroscedastic
+        self.mlp = _build_mlp(u_dim + v_dim, x_dim, hidden_dims, nn.ELU(), None)
+        if heteroscedastic:
+            self.mlp_logvar = _build_mlp(u_dim + v_dim, x_dim, hidden_dims, nn.ELU(), None)
 
     def forward(self, u, v):
-        """
-        Forward pass of DecoderX.
-
-        Args:
-            u (torch.Tensor): Latent variable u, shape (batch_size, u_dim).
-            v (torch.Tensor): Latent variable v, shape (batch_size, v_dim).
-
-        Returns:
-            torch.Tensor: Reconstructed mean of x, shape (batch_size, x_dim).
-        """
-        input_concat = torch.cat((u, v), dim=1)
-        x_mean = self.mlp(input_concat)
+        h = torch.cat((u, v), dim=1)
+        x_mean = self.mlp(h)
+        if self.heteroscedastic:
+            return x_mean, self.mlp_logvar(h)
         return x_mean
 
 class DecoderT(nn.Module):
@@ -256,50 +229,22 @@ class DecoderT(nn.Module):
         return t_logits
 
 class DecoderY(nn.Module):
-    """
-    Decoder for outcome y: p_theta_y(y | x, u, t).
+    """Decoder p_theta_y(y | x, u, t).  Optionally heteroscedastic."""
 
-    This network predicts the mean of the outcome y, given observed
-    covariates x, latent variable u, and treatment t. Assumes y is continuous.
-
-    Attributes:
-        mlp (nn.Sequential): The MLP layers for decoding.
-    """
-    def __init__(self, x_dim, u_dim, t_dim, y_dim, hidden_dims):
-        """
-        Initializes the DecoderY network.
-
-        Args:
-            x_dim (int): Dimensionality of observed covariates x.
-            u_dim (int): Dimensionality of latent variable u.
-            t_dim (int): Dimensionality of treatment t (typically 1 for binary).
-            y_dim (int): Dimensionality of outcome y (typically 1).
-            hidden_dims (list of int): List of hidden layer sizes for the MLP.
-        """
+    def __init__(self, x_dim, u_dim, t_dim, y_dim, hidden_dims, heteroscedastic=False):
         super().__init__()
-        self.mlp = _build_mlp(
-            input_dim=x_dim + u_dim + t_dim,
-            output_dim=y_dim, # Outputting y_mean
-            hidden_dims=hidden_dims,
-            activation=nn.ELU(),
-            output_activation=None # Linear output for mean
-        )
+        self.heteroscedastic = heteroscedastic
+        in_dim = x_dim + u_dim + t_dim
+        self.mlp = _build_mlp(in_dim, y_dim, hidden_dims, nn.ELU(), None)
+        if heteroscedastic:
+            self.mlp_logvar = _build_mlp(in_dim, y_dim, hidden_dims, nn.ELU(), None)
 
     def forward(self, x, u, t):
-        """
-        Forward pass of DecoderY.
-
-        Args:
-            x (torch.Tensor): Observed covariates x, shape (batch_size, x_dim).
-            u (torch.Tensor): Latent variable u, shape (batch_size, u_dim).
-            t (torch.Tensor): Treatment, shape (batch_size, t_dim) or (batch_size,).
-
-        Returns:
-            torch.Tensor: Predicted mean of outcome y, shape (batch_size, y_dim).
-        """
         if t.ndim == 1: t = t.unsqueeze(1)
-        input_concat = torch.cat((x, u, t), dim=1)
-        y_mean = self.mlp(input_concat)
+        h = torch.cat((x, u, t), dim=1)
+        y_mean = self.mlp(h)
+        if self.heteroscedastic:
+            return y_mean, self.mlp_logvar(h)
         return y_mean
 
 class AuxiliaryQTX(nn.Module):
@@ -385,6 +330,23 @@ class AuxiliaryQYXT(nn.Module):
         input_concat = torch.cat((x, t), dim=1)
         y_mean = self.mlp(input_concat)
         return y_mean
+
+class ConditionalPriorU(nn.Module):
+    """Conditional prior p_θ(u | x) outputting (mean, logvar)."""
+
+    def __init__(self, x_dim, u_dim, hidden_dims):
+        super().__init__()
+        last_h = hidden_dims[-1] if hidden_dims else x_dim
+        self.shared = _build_mlp(x_dim, last_h,
+                                 hidden_dims[:-1] if hidden_dims else [],
+                                 nn.ELU(), nn.ELU() if hidden_dims else None)
+        self.fc_mean = nn.Linear(last_h, u_dim)
+        self.fc_logvar = nn.Linear(last_h, u_dim)
+
+    def forward(self, x):
+        h = self.shared(x)
+        return self.fc_mean(h), self.fc_logvar(h)
+
 
 # Example Usage (for testing purposes, can be removed or commented out)
 if __name__ == '__main__':
