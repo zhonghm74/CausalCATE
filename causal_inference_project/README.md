@@ -7,8 +7,12 @@ A comprehensive Python library implementing **6 causal inference algorithms** fo
 ### 1. Install Dependencies
 
 ```bash
+# CPU-only PyTorch (recommended for most users)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install scikit-learn pytest pandas streamlit matplotlib plotly
+pip install -r causal_inference_project/requirements.txt
+
+# Or with GPU support: install PyTorch with CUDA first, then:
+# pip install -r causal_inference_project/requirements.txt
 ```
 
 ### 2. Run Tests
