@@ -224,7 +224,7 @@ elif algo == "DML":
             te = st.number_input("True effect", value=2.0, step=0.1, key="cate_te")
             sd = st.number_input("Seed", value=42, step=1, key="cate_seed")
             st.subheader("Method")
-            method = st.radio("CATE method", ["R-Learner", "DR-Learner"], key="cate_m")
+            method = st.radio("CATE method", ["R-Learner", "DR-Learner", "X-Learner"], key="cate_m")
             final_model = st.selectbox("Final τ(x) model", ["Ridge", "RandomForestRegressor", "GradientBoosting"], key="cate_fm")
             run_cate = st.button("Run CATE", type="primary", use_container_width=True, key="cate_run")
         with col_res:
@@ -232,14 +232,19 @@ elif algo == "DML":
                 with st.spinner("Estimating CATE …"):
                     X, y, T = generate_dml_data(n_s, n_f, te, True, int(sd))
                     cate_m = MODEL_MAP[final_model]()
+                    from algorithms.dml.dml_cate import x_learner
                     if method == "R-Learner":
                         cres = r_learner(X, y, T, LinearRegression(),
                                          LogisticRegression(solver='liblinear', random_state=42),
                                          cate_m, n_folds=5)
-                    else:
+                    elif method == "DR-Learner":
                         cres = dr_learner(X, y, T, LinearRegression(), LinearRegression(),
                                           LogisticRegression(solver='liblinear', random_state=42),
                                           cate_m, n_folds=5)
+                    else:
+                        cres = x_learner(X, y, T, LinearRegression(), LinearRegression(),
+                                         LogisticRegression(solver='liblinear', random_state=42),
+                                         cate_m, MODEL_MAP[final_model](), n_folds=5)
                 st.subheader("Results")
                 m1, m2, m3 = st.columns(3)
                 m1.metric("ATE", f"{cres.ate:.4f}")

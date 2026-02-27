@@ -14,7 +14,7 @@ from algorithms.dml.dml_core import (
     double_ml, double_ml_crossfit, double_ml_multi_treatment,
     DMLResult, DMLMultiResult,
 )
-from algorithms.dml.dml_cate import r_learner, dr_learner, CATEResult
+from algorithms.dml.dml_cate import r_learner, dr_learner, x_learner, CATEResult
 from algorithms.dml.dml_auto import auto_dml, AutoDMLResult
 from algorithms.dml.dml_iv import iv_dml, did_dml, IVDMLResult, DiDDMLResult
 
@@ -278,6 +278,41 @@ class TestCATE:
         s = res.summary()
         assert "R-Learner" in s
         assert "ATE" in s
+
+    def test_x_learner_returns_result(self):
+        X, y, T, _ = _binary_data(n=1000)
+        res = x_learner(
+            X, y, T,
+            ml_model_y0=LinearRegression(),
+            ml_model_y1=LinearRegression(),
+            ml_model_t=LogisticRegression(solver='liblinear', random_state=42),
+            cate_model_0=Ridge(), cate_model_1=Ridge(),
+            n_folds=3,
+        )
+        assert isinstance(res, CATEResult)
+        assert res.method == "X-Learner"
+        assert len(res.tau_hat) == len(y)
+
+    def test_x_learner_constant_effect(self):
+        X, y, T, te = _binary_data(n=3000)
+        res = x_learner(
+            X, y, T,
+            ml_model_y0=RandomForestRegressor(n_estimators=50, random_state=42),
+            ml_model_y1=RandomForestRegressor(n_estimators=50, random_state=42),
+            ml_model_t=RandomForestClassifier(n_estimators=50, random_state=42),
+            cate_model_0=Ridge(), cate_model_1=Ridge(),
+            n_folds=3,
+        )
+        assert res.ate == pytest.approx(te, abs=0.5)
+
+    def test_x_learner_summary(self):
+        X, y, T, _ = _binary_data(n=500)
+        res = x_learner(
+            X, y, T, LinearRegression(), LinearRegression(),
+            LogisticRegression(solver='liblinear', random_state=42),
+            Ridge(), Ridge(), n_folds=3,
+        )
+        assert "X-Learner" in res.summary()
 
 
 # ===================================================================

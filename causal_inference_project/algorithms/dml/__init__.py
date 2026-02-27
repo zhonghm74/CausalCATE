@@ -5,6 +5,6 @@ from .dml_core import (
     DMLResult,
     DMLMultiResult,
 )
-from .dml_cate import r_learner, dr_learner, CATEResult
+from .dml_cate import r_learner, dr_learner, x_learner, CATEResult
 from .dml_auto import auto_dml, AutoDMLResult
 from .dml_iv import iv_dml, did_dml, IVDMLResult, DiDDMLResult

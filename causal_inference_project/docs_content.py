@@ -48,7 +48,7 @@ $$SE(\hat{\theta}) = \sqrt{\frac{1}{n} \cdot \frac{E[\psi_i^2]}{(E[\tilde{T}_i^2
 | Extension | Module | Description |
 |-----------|--------|-------------|
 | **Cross-fitting** | `dml_core.py` | K-fold sample splitting with Neyman-orthogonal inference |
-| **CATE** | `dml_cate.py` | R-Learner & DR-Learner for $\tau(x) = E[Y(1)-Y(0)|X=x]$ |
+| **CATE** | `dml_cate.py` | R-Learner, DR-Learner & X-Learner for $\tau(x) = E[Y(1)-Y(0)|X=x]$ |
 | **Multi-treatment** | `dml_core.py` | Categorical $T \in \{0,1,...,K\}$ via one-vs-reference |
 | **Auto selection** | `dml_auto.py` | CV-based model selection from a catalogue |
 | **IV-DML** | `dml_iv.py` | Instrumental variable DML for LATE |
@@ -69,6 +69,18 @@ result = double_ml_crossfit(
 )
 print(result.summary())
 # θ = 2.49 ***, SE = 0.005, 95% CI = [2.48, 2.50]
+
+# X-Learner for heterogeneous effects
+from algorithms.dml import x_learner
+from sklearn.linear_model import Ridge
+
+cate = x_learner(
+    X, y, T,
+    ml_model_y0=LinearRegression(), ml_model_y1=LinearRegression(),
+    ml_model_t=LogisticRegression(),
+    cate_model_0=Ridge(), cate_model_1=Ridge(),
+)
+print(f"ATE = {cate.ate:.4f}, τ(x) std = {cate.tau_hat.std():.4f}")
 ```
 """)
 

@@ -1,14 +1,16 @@
 """
 Conditional Average Treatment Effect (CATE) estimators built on DML.
 
-Implements the R-Learner and DR-Learner for heterogeneous treatment effect
-estimation τ(x) = E[Y(1) − Y(0) | X = x].
+Implements the R-Learner, DR-Learner, and X-Learner for heterogeneous
+treatment effect estimation τ(x) = E[Y(1) − Y(0) | X = x].
 
 References:
     Nie, X. & Wager, S. (2021). "Quasi-oracle estimation of heterogeneous
     treatment effects." Biometrika, 108(2).
     Kennedy, E. H. (2023). "Towards optimal doubly robust estimation of
     heterogeneous causal effects." Electronic Journal of Statistics.
+    Künzel, S. R., et al. (2019). "Metalearners for estimating heterogeneous
+    treatment effects using machine learning." PNAS, 116(10).
 """
 
 import numpy as np
@@ -216,4 +218,103 @@ def dr_learner(
         method="DR-Learner", tau_hat=tau_hat,
         ate=ate, ate_se=ate_se, cate_model=cate_fit,
         pseudo_outcomes=pseudo,
+    )
+
+
+# ---------------------------------------------------------------------------
+# X-Learner
+# ---------------------------------------------------------------------------
+
+def x_learner(
+    X, y, T, ml_model_y0, ml_model_y1, ml_model_t, cate_model_0, cate_model_1,
+    n_folds=5, random_state=42,
+):
+    """X-Learner for CATE estimation (Künzel et al., 2019).
+
+    Four steps:
+      1. Fit outcome models μ̂₀(x), μ̂₁(x) on control/treated subsets.
+      2. Impute individual treatment effects:
+         - Treated:  D¹ᵢ = Yᵢ − μ̂₀(Xᵢ)
+         - Control:  D⁰ᵢ = μ̂₁(Xᵢ) − Yᵢ
+      3. Fit two CATE models: τ̂₁(x) on treated D¹, τ̂₀(x) on control D⁰.
+      4. Combine: τ̂(x) = ê(x)·τ̂₀(x) + (1−ê(x))·τ̂₁(x)
+         where ê(x) is the propensity score.
+
+    Args:
+        X: Feature matrix (n, p).
+        y: Outcome vector (n,).
+        T: Binary treatment vector (n,).
+        ml_model_y0: Model for E[Y|X, T=0].
+        ml_model_y1: Model for E[Y|X, T=1].
+        ml_model_t: Propensity model for P(T=1|X).
+        cate_model_0: Model to fit τ₀(x) on control imputed effects.
+        cate_model_1: Model to fit τ₁(x) on treated imputed effects.
+        n_folds: Number of cross-fitting folds.
+        random_state: Random seed.
+
+    Returns:
+        CATEResult with per-sample τ̂(x), ATE, and fitted models.
+    """
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+    T = np.asarray(T, dtype=float)
+    n = len(y)
+
+    mask1 = T == 1
+    mask0 = T == 0
+
+    # --- Step 1: Cross-fitted outcome models ---
+    mu0_hat = np.zeros(n)
+    mu1_hat = np.zeros(n)
+    e_hat = np.zeros(n)
+
+    kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+    for train_idx, test_idx in kf.split(X):
+        X_tr, X_te = X[train_idx], X[test_idx]
+        y_tr, T_tr = y[train_idx], T[train_idx]
+
+        tr0 = T_tr == 0
+        tr1 = T_tr == 1
+
+        m0 = deepcopy(ml_model_y0)
+        m1 = deepcopy(ml_model_y1)
+        mt = deepcopy(ml_model_t)
+
+        if tr0.sum() > 0:
+            m0.fit(X_tr[tr0], y_tr[tr0])
+            mu0_hat[test_idx] = m0.predict(X_te)
+        if tr1.sum() > 0:
+            m1.fit(X_tr[tr1], y_tr[tr1])
+            mu1_hat[test_idx] = m1.predict(X_te)
+
+        mt.fit(X_tr, T_tr)
+        if hasattr(mt, 'predict_proba'):
+            e_hat[test_idx] = mt.predict_proba(X_te)[:, 1]
+        else:
+            e_hat[test_idx] = mt.predict(X_te)
+
+    e_hat = np.clip(e_hat, 0.01, 0.99)
+
+    # --- Step 2: Imputed treatment effects ---
+    D1 = y[mask1] - mu0_hat[mask1]   # treated: observed Y - predicted Y(0)
+    D0 = mu1_hat[mask0] - y[mask0]   # control: predicted Y(1) - observed Y
+
+    # --- Step 3: Fit CATE models on each group ---
+    tau1_model = deepcopy(cate_model_1)
+    tau0_model = deepcopy(cate_model_0)
+    tau1_model.fit(X[mask1], D1)
+    tau0_model.fit(X[mask0], D0)
+
+    # --- Step 4: Propensity-weighted combination ---
+    tau1_all = tau1_model.predict(X)
+    tau0_all = tau0_model.predict(X)
+    tau_hat = e_hat * tau0_all + (1 - e_hat) * tau1_all
+
+    ate = float(tau_hat.mean())
+    ate_se = float(tau_hat.std() / np.sqrt(n))
+
+    return CATEResult(
+        method="X-Learner", tau_hat=tau_hat,
+        ate=ate, ate_se=ate_se, cate_model=None,
+        y_residuals=None, t_residuals=None,
     )
