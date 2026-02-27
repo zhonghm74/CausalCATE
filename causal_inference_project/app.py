@@ -26,6 +26,7 @@ from algorithms.srcvae.srcvae_model import SRCVAEModel
 from algorithms.tarnet.tarnet_model import TARNetModel
 from algorithms.dragonnet.dragonnet_model import DragonNetModel
 from algorithms.ganite.ganite_model import GANITEModel
+import docs_content
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -135,6 +136,8 @@ if algo == "Overview":
 # ============================= DML ==========================================
 elif algo == "DML":
     st.title("Double / Debiased Machine Learning (DML)")
+    with st.expander("📖 Algorithm Theory, Architecture & Usage", expanded=False):
+        docs_content.show_dml_theory()
 
     from sklearn.linear_model import LinearRegression, Lasso, LogisticRegression, Ridge
     from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
@@ -393,6 +396,8 @@ elif algo == "MIM-DRCFR":
         "Disentangled representations with MMD-based IPM and mutual-information "
         "regularisation for counterfactual regression."
     )
+    with st.expander("📖 Algorithm Theory, Architecture & Usage", expanded=False):
+        docs_content.show_drcfr_theory()
 
     col_cfg, col_res = st.columns([1, 2])
 
@@ -559,6 +564,8 @@ elif algo == "SRCVAE":
         "instrumental variables (**v**) for causal effect estimation under "
         "unobserved confounding."
     )
+    with st.expander("📖 Algorithm Theory, Architecture & Usage", expanded=False):
+        docs_content.show_srcvae_theory()
 
     col_cfg, col_res = st.columns([1, 2])
 
@@ -747,6 +754,8 @@ elif algo == "TARNet":
         "Shared representation followed by two treatment-specific outcome heads. "
         "A simpler baseline without distributional balancing (no IPM/MMD)."
     )
+    with st.expander("📖 Algorithm Theory, Architecture & Usage", expanded=False):
+        docs_content.show_tarnet_theory()
 
     col_cfg, col_res = st.columns([1, 2])
     with col_cfg:
@@ -825,6 +834,8 @@ elif algo == "DragonNet":
         "TARNet extended with a **propensity score head** ε(x) and "
         "**targeted regularization** for doubly-robust-style bias correction."
     )
+    with st.expander("📖 Algorithm Theory, Architecture & Usage", expanded=False):
+        docs_content.show_dragonnet_theory()
 
     col_cfg, col_res = st.columns([1, 2])
     with col_cfg:
@@ -923,6 +934,8 @@ elif algo == "GANITE":
         "Two-stage GAN: **Stage 1** trains a counterfactual generator + discriminator, "
         "**Stage 2** trains an ITE predictor on the generator's pseudo-outcomes."
     )
+    with st.expander("📖 Algorithm Theory, Architecture & Usage", expanded=False):
+        docs_content.show_ganite_theory()
 
     col_cfg, col_res = st.columns([1, 2])
     with col_cfg:
