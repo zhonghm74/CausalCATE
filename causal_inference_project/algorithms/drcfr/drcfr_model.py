@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from .networks import Encoder, PredictionHead
+from .networks import Encoder, PredictionHead, AttentionEncoder
 from .losses import factual_mse_loss, ipm_loss_zy, mi_loss_zs_t
 
 
@@ -24,11 +24,18 @@ class DRCFRModel(nn.Module):
                  learning_rate=1e-3, weight_decay=1e-4,
                  sigmas_ipm=None, sigmas_mi=None,
                  dropout=0.0, use_batchnorm=False,
-                 ipm_method='mmd', sinkhorn_eps=0.1):
+                 ipm_method='mmd', sinkhorn_eps=0.1,
+                 encoder_type='mlp',
+                 attn_embed_dim=32, attn_n_heads=4, attn_n_layers=2):
         super(DRCFRModel, self).__init__()
 
-        self.encoder = Encoder(input_dim, hidden_dims_phi, latent_dim_zy, latent_dim_zs,
-                               dropout=dropout, use_batchnorm=use_batchnorm)
+        if encoder_type == 'attention':
+            self.encoder = AttentionEncoder(
+                input_dim, attn_embed_dim, attn_n_heads, attn_n_layers,
+                latent_dim_zy, latent_dim_zs, dropout=dropout)
+        else:
+            self.encoder = Encoder(input_dim, hidden_dims_phi, latent_dim_zy, latent_dim_zs,
+                                   dropout=dropout, use_batchnorm=use_batchnorm)
         self.h0 = PredictionHead(latent_dim_zy, hidden_dims_h, output_dim,
                                  dropout=dropout, use_batchnorm=use_batchnorm)
         self.h1 = PredictionHead(latent_dim_zy, hidden_dims_h, output_dim,
@@ -277,13 +284,41 @@ class DRCFRModel(nn.Module):
                 - y1_pred (torch.Tensor): Predicted potential outcomes Y(1),
                                           shape (n_samples, output_dim).
         """
-        self.eval() # Set model to evaluation mode
+        self.eval()
         x = x.to(self.device)
         with torch.no_grad():
             z_y, _ = self.encoder(x)
             y0_pred = self.h0(z_y)
             y1_pred = self.h1(z_y)
         return y0_pred, y1_pred
+
+    def predict_ite_with_uncertainty(self, x, n_mc=50):
+        """MC Dropout uncertainty estimation for ITE.
+
+        Performs ``n_mc`` stochastic forward passes with dropout enabled
+        and returns the mean and standard deviation of ITE predictions.
+
+        Requires the model to have been created with ``dropout > 0``.
+
+        Args:
+            x: Input features (n, input_dim).
+            n_mc: Number of MC forward passes.
+
+        Returns:
+            (ite_mean, ite_std) — both shape (n, output_dim).
+        """
+        self.train()  # enable dropout
+        x = x.to(self.device)
+        ites = []
+        with torch.no_grad():
+            for _ in range(n_mc):
+                z_y, _ = self.encoder(x)
+                y0 = self.h0(z_y)
+                y1 = self.h1(z_y)
+                ites.append((y1 - y0).unsqueeze(0))
+        stacked = torch.cat(ites, dim=0)  # (n_mc, n, out)
+        self.eval()
+        return stacked.mean(dim=0), stacked.std(dim=0)
 
 # Example Usage (for testing purposes, can be removed or commented out later)
 if __name__ == '__main__':

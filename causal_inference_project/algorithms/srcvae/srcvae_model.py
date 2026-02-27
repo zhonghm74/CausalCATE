@@ -9,7 +9,8 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-from .srcvae_networks import EncoderU, EncoderV, DecoderX, DecoderT, DecoderY, AuxiliaryQTX, AuxiliaryQYXT
+from .srcvae_networks import (EncoderU, EncoderV, DecoderX, DecoderT, DecoderY,
+                              AuxiliaryQTX, AuxiliaryQYXT, ConditionalPriorU)
 from .srcvae_losses import (kl_gaussian_loss, reconstruction_mse_loss,
                             reconstruction_bce_loss, gaussian_nll_loss,
                             kl_gaussian_to_mog)
@@ -55,7 +56,8 @@ class SRCVAEModel(nn.Module):
                  learning_rate=1e-3, weight_decay=1e-4, device=None,
                  heteroscedastic=False,
                  n_iwae_samples=1,
-                 prior='standard', n_mog_components=5):
+                 prior='standard', n_mog_components=5,
+                 conditional_prior_u=False, hidden_dims_prior_u=None):
         """
         Initializes the SRCVAEModel.
 
@@ -104,6 +106,10 @@ class SRCVAEModel(nn.Module):
                                   heteroscedastic=heteroscedastic)
         self.aux_qtx = AuxiliaryQTX(x_dim, t_dim, hidden_dims_aux_qtx)
         self.aux_qyxt = AuxiliaryQYXT(x_dim, t_dim, y_dim, hidden_dims_aux_qyxt)
+        self.conditional_prior_u = conditional_prior_u
+        if conditional_prior_u:
+            h_prior = hidden_dims_prior_u or [32, 16]
+            self.prior_u_net = ConditionalPriorU(x_dim, u_dim, h_prior)
 
         # Store loss weights
         self.alpha_x = alpha_x
@@ -248,17 +254,28 @@ class SRCVAEModel(nn.Module):
                 - loss_components (dict): A dictionary containing the itemized values of
                                           individual loss components.
         """
-        if self.prior_type == 'mog':
+        if self.conditional_prior_u:
+            prior_u_mean, prior_u_logvar = self.prior_u_net(x_true)
+            diff_mean = u_mean - prior_u_mean
+            loss_kl_u = 0.5 * (
+                (prior_u_logvar - u_logvar)
+                + (u_logvar.exp() + diff_mean.pow(2)) / (prior_u_logvar.exp() + 1e-8)
+                - 1
+            ).sum(dim=1).mean()
+        elif self.prior_type == 'mog':
             u_samples = self.reparameterize(u_mean, u_logvar)
-            v_samples = self.reparameterize(v_mean, v_logvar)
             loss_kl_u = kl_gaussian_to_mog(
                 u_samples, u_mean, u_logvar,
                 self.mog_u_means, self.mog_u_logvars, self.mog_u_logweights)
+        else:
+            loss_kl_u = kl_gaussian_loss(u_mean, u_logvar)
+
+        if self.prior_type == 'mog':
+            v_samples = self.reparameterize(v_mean, v_logvar)
             loss_kl_v = kl_gaussian_to_mog(
                 v_samples, v_mean, v_logvar,
                 self.mog_v_means, self.mog_v_logvars, self.mog_v_logweights)
         else:
-            loss_kl_u = kl_gaussian_loss(u_mean, u_logvar)
             loss_kl_v = kl_gaussian_loss(v_mean, v_logvar)
 
         # Ensure t_true and y_true have correct shapes for loss functions if they are 1D

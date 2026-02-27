@@ -1,11 +1,13 @@
 """
 Neural Network Components for MIM-DRCFR Model.
 
-Includes Encoder (input → z_y, z_s) and PredictionHead (z_y → outcome),
-with optional Dropout and BatchNorm for regularisation.
+Includes MLP and Attention-based Encoders, PredictionHead,
+with optional Dropout and BatchNorm.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 
 def _build_block(in_dim, out_dim, use_batchnorm=False, dropout=0.0):
@@ -59,6 +61,40 @@ class PredictionHead(nn.Module):
 
     def forward(self, z_y):
         return self.network(z_y)
+
+
+class AttentionEncoder(nn.Module):
+    """Attention-based encoder that treats each feature as a token.
+
+    Projects input features to an embedding space, applies multi-head
+    self-attention to capture feature interactions, then produces
+    (z_y, z_s) via linear heads.
+    """
+
+    def __init__(self, input_dim, embed_dim, n_heads, n_layers,
+                 latent_dim_zy, latent_dim_zs, dropout=0.0):
+        super().__init__()
+        self.input_proj = nn.Linear(1, embed_dim)
+        self.pos_emb = nn.Parameter(torch.randn(1, input_dim, embed_dim) * 0.02)
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * 2,
+            dropout=dropout, activation='gelu', batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.pool_fc = nn.Linear(input_dim * embed_dim, embed_dim)
+        self.fc_zy = nn.Linear(embed_dim, latent_dim_zy)
+        self.fc_zs = nn.Linear(embed_dim, latent_dim_zs)
+
+    def forward(self, x):
+        B, D = x.shape
+        tokens = x.unsqueeze(-1)           # (B, D, 1)
+        tokens = self.input_proj(tokens)    # (B, D, embed)
+        tokens = tokens + self.pos_emb[:, :D, :]
+        h = self.transformer(tokens)        # (B, D, embed)
+        h_flat = h.reshape(B, -1)           # (B, D*embed)
+        h_pool = F.elu(self.pool_fc(h_flat))
+        return self.fc_zy(h_pool), self.fc_zs(h_pool)
 
 # Example Usage (for testing purposes, can be removed or commented out)
 if __name__ == '__main__':

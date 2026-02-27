@@ -331,6 +331,23 @@ class AuxiliaryQYXT(nn.Module):
         y_mean = self.mlp(input_concat)
         return y_mean
 
+class ConditionalPriorU(nn.Module):
+    """Conditional prior p_θ(u | x) outputting (mean, logvar)."""
+
+    def __init__(self, x_dim, u_dim, hidden_dims):
+        super().__init__()
+        last_h = hidden_dims[-1] if hidden_dims else x_dim
+        self.shared = _build_mlp(x_dim, last_h,
+                                 hidden_dims[:-1] if hidden_dims else [],
+                                 nn.ELU(), nn.ELU() if hidden_dims else None)
+        self.fc_mean = nn.Linear(last_h, u_dim)
+        self.fc_logvar = nn.Linear(last_h, u_dim)
+
+    def forward(self, x):
+        h = self.shared(x)
+        return self.fc_mean(h), self.fc_logvar(h)
+
+
 # Example Usage (for testing purposes, can be removed or commented out)
 if __name__ == '__main__':
     x_dim, t_dim, y_dim, u_dim, v_dim = 10, 1, 1, 5, 4
