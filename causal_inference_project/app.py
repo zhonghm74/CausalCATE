@@ -93,7 +93,7 @@ C_BG = "#0e1117"
 st.sidebar.title("Causal Inference Lab")
 algo = st.sidebar.radio(
     "Select Algorithm",
-    ["Overview", "DML", "MIM-DRCFR", "SRCVAE"],
+    ["Overview", "DML", "MIM-DRCFR", "SRCVAE", "IHDP Benchmark"],
     index=0,
 )
 st.sidebar.markdown("---")
@@ -736,3 +736,144 @@ elif algo == "SRCVAE":
             st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("Configure parameters on the left and click **Run SRCVAE**.")
+
+# ============================= IHDP BENCHMARK ================================
+elif algo == "IHDP Benchmark":
+    st.title("IHDP Benchmark — Algorithm Comparison")
+    st.markdown(
+        "Run all three algorithms on the IHDP semi-synthetic benchmark and "
+        "compare ATE error, PEHE, and ATT error side by side."
+    )
+
+    from data.ihdp import generate_ihdp
+    from evaluation.metrics import evaluation_report
+    from sklearn.linear_model import LinearRegression, LogisticRegression, Ridge
+
+    col_cfg, col_res = st.columns([1, 3])
+    with col_cfg:
+        st.subheader("Settings")
+        n_ihdp = st.slider("IHDP samples", 200, 2000, 747, 50, key="bench_n")
+        n_feat = st.slider("Features", 10, 30, 25, key="bench_f")
+        seed = st.number_input("Seed", value=42, step=1, key="bench_seed")
+        drcfr_epochs = st.slider("DRCFR epochs", 20, 200, 80, 10, key="bench_dr_ep")
+        srcvae_epochs = st.slider("SRCVAE epochs", 20, 200, 50, 10, key="bench_sv_ep")
+        run_bench = st.button("Run Benchmark", type="primary", use_container_width=True, key="bench_run")
+
+    with col_res:
+        if run_bench:
+            progress = st.progress(0, text="Generating IHDP data …")
+            ds = generate_ihdp(n_samples=n_ihdp, n_features=n_feat, seed=int(seed))
+            train, test = ds.train_test_split(test_size=0.2, random_state=int(seed))
+
+            results = {}
+
+            # --- DML ---
+            progress.progress(10, text="Running DML …")
+            from algorithms.dml.dml_cate import dr_learner
+            cres = dr_learner(
+                train.X, train.Y, train.T,
+                ml_model_y0=LinearRegression(), ml_model_y1=LinearRegression(),
+                ml_model_t=LogisticRegression(solver='liblinear', random_state=42),
+                cate_model=Ridge(alpha=1.0), n_folds=3,
+            )
+            dml_ite_test = cres.predict(test.X)
+            dml_report = evaluation_report(test.ITE, dml_ite_test, test.T)
+            results["DML (DR-Learner)"] = dml_report
+
+            # --- DRCFR ---
+            progress.progress(30, text="Training DRCFR …")
+            import torch
+            x_tr_t = torch.tensor(train.X, dtype=torch.float32)
+            t_tr_t = torch.tensor(train.T, dtype=torch.float32)
+            yf_tr_t = torch.tensor(train.Y, dtype=torch.float32).unsqueeze(1)
+            x_te_t = torch.tensor(test.X, dtype=torch.float32)
+
+            drcfr = DRCFRModel(
+                input_dim=n_feat, hidden_dims_phi=[64, 32], latent_dim_zy=16,
+                latent_dim_zs=16, hidden_dims_h=[32], output_dim=1,
+                alpha=1.0, beta=0.1, learning_rate=1e-3, dropout=0.1,
+            )
+            drcfr.fit(x_tr_t, yf_tr_t, t_tr_t, num_epochs=drcfr_epochs,
+                      batch_size=min(128, n_ihdp), print_every_epochs=9999)
+            drcfr_ite = drcfr.predict_ite(x_te_t).cpu().numpy().flatten()
+            drcfr_report = evaluation_report(test.ITE, drcfr_ite, test.T)
+            results["MIM-DRCFR"] = drcfr_report
+
+            # --- SRCVAE ---
+            progress.progress(60, text="Training SRCVAE …")
+            srcvae = SRCVAEModel(
+                x_dim=n_feat, t_dim=1, y_dim=1, u_dim=5, v_dim=5,
+                hidden_dims_encoder_u=[64, 32], hidden_dims_encoder_v=[64, 32],
+                hidden_dims_decoder_x=[32, 64], hidden_dims_decoder_t=[32, 64],
+                hidden_dims_decoder_y=[32, 64], hidden_dims_aux_qtx=[32],
+                hidden_dims_aux_qyxt=[32],
+                alpha_x=1.0, alpha_t=1.0, alpha_y=1.0,
+                beta_u=0.1, beta_v=0.1, gamma_t=1.0, gamma_y=1.0,
+                learning_rate=1e-3,
+            )
+            srcvae.fit(
+                torch.tensor(train.X, dtype=torch.float32),
+                torch.tensor(train.T, dtype=torch.float32),
+                torch.tensor(train.Y, dtype=torch.float32),
+                num_epochs=srcvae_epochs, batch_size=min(128, n_ihdp),
+                print_every_epochs=9999, kl_warmup_epochs=10,
+            )
+            ite_sv, _, _ = srcvae.estimate_causal_effect(x_te_t, n_samples_u=50)
+            srcvae_ite = ite_sv.cpu().numpy().flatten()
+            srcvae_report = evaluation_report(test.ITE, srcvae_ite, test.T)
+            results["SRCVAE"] = srcvae_report
+
+            progress.progress(100, text="Done!")
+
+            # --- Display results ---
+            st.subheader("Comparison Results")
+
+            # Metrics table
+            import pandas as pd
+            rows = []
+            for name, r in results.items():
+                rows.append({
+                    "Algorithm": name,
+                    "ATE Error": f"{r.ate_abs_error:.4f}",
+                    "PEHE": f"{r.pehe:.4f}",
+                    "ATT Error": f"{r.att_abs_error:.4f}" if r.att_abs_error is not None else "N/A",
+                    "Policy Risk": f"{r.policy_risk:.4f}" if r.policy_risk is not None else "N/A",
+                })
+            st.dataframe(pd.DataFrame(rows).set_index("Algorithm"), use_container_width=True)
+
+            # Bar chart comparison
+            algo_names = list(results.keys())
+            fig = make_subplots(rows=1, cols=3,
+                subplot_titles=("ATE Error (↓)", "PEHE (↓)", "ATT Error (↓)"))
+            colors = [C_PRIMARY, C_SECONDARY, C_SUCCESS]
+            for i, metric in enumerate(["ate_abs_error", "pehe", "att_abs_error"]):
+                vals = [getattr(results[n], metric, 0) or 0 for n in algo_names]
+                fig.add_trace(go.Bar(x=algo_names, y=vals,
+                    marker_color=colors, name=metric), row=1, col=i+1)
+            fig.update_layout(height=350, template="plotly_dark", showlegend=False,
+                              margin=dict(t=40, b=30))
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ITE distribution overlay
+            fig2 = go.Figure()
+            fig2.add_trace(go.Histogram(x=test.ITE, nbinsx=40,
+                marker_color="white", opacity=0.3, name="True ITE"))
+            for name, color in zip(algo_names, colors):
+                if name == "DML (DR-Learner)":
+                    ite = dml_ite_test
+                elif name == "MIM-DRCFR":
+                    ite = drcfr_ite
+                else:
+                    ite = srcvae_ite
+                fig2.add_trace(go.Histogram(x=ite, nbinsx=40,
+                    marker_color=color, opacity=0.5, name=name))
+            fig2.update_layout(barmode="overlay", title="ITE Distributions (Test Set)",
+                xaxis_title="ITE", yaxis_title="Count",
+                height=400, template="plotly_dark", margin=dict(t=40, b=30))
+            st.plotly_chart(fig2, use_container_width=True)
+
+            st.markdown("---")
+            st.markdown(f"**IHDP dataset**: {ds.n_samples} samples, "
+                        f"{ds.n_features} features | True ATE = {ds.ATE:.4f}")
+        else:
+            st.info("Configure settings and click **Run Benchmark**.")

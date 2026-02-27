@@ -10,7 +10,9 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
 from .srcvae_networks import EncoderU, EncoderV, DecoderX, DecoderT, DecoderY, AuxiliaryQTX, AuxiliaryQYXT
-from .srcvae_losses import kl_gaussian_loss, reconstruction_mse_loss, reconstruction_bce_loss, gaussian_nll_loss
+from .srcvae_losses import (kl_gaussian_loss, reconstruction_mse_loss,
+                            reconstruction_bce_loss, gaussian_nll_loss,
+                            kl_gaussian_to_mog)
 
 class SRCVAEModel(nn.Module):
     """
@@ -51,7 +53,9 @@ class SRCVAEModel(nn.Module):
                  beta_u, beta_v,
                  gamma_t, gamma_y,
                  learning_rate=1e-3, weight_decay=1e-4, device=None,
-                 heteroscedastic=False):
+                 heteroscedastic=False,
+                 n_iwae_samples=1,
+                 prior='standard', n_mog_components=5):
         """
         Initializes the SRCVAEModel.
 
@@ -88,6 +92,8 @@ class SRCVAEModel(nn.Module):
         self.u_dim = u_dim
         self.v_dim = v_dim
         self.heteroscedastic = heteroscedastic
+        self.n_iwae_samples = n_iwae_samples
+        self.prior_type = prior
 
         self.encoder_u = EncoderU(x_dim, t_dim, y_dim, u_dim, hidden_dims_encoder_u)
         self.encoder_v = EncoderV(x_dim, t_dim, v_dim, hidden_dims_encoder_v)
@@ -108,7 +114,17 @@ class SRCVAEModel(nn.Module):
         self.gamma_t = gamma_t
         self.gamma_y = gamma_y
 
-        # Optimizer
+        # MoG prior parameters (learnable)
+        if prior == 'mog':
+            K = n_mog_components
+            self.mog_u_means = nn.Parameter(torch.randn(K, u_dim) * 0.1)
+            self.mog_u_logvars = nn.Parameter(torch.zeros(K, u_dim))
+            self.mog_u_logweights = nn.Parameter(torch.zeros(K))
+            self.mog_v_means = nn.Parameter(torch.randn(K, v_dim) * 0.1)
+            self.mog_v_logvars = nn.Parameter(torch.zeros(K, v_dim))
+            self.mog_v_logweights = nn.Parameter(torch.zeros(K))
+
+        # Optimizer (must come after all parameter definitions)
         self.optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
         # Device handling
@@ -232,8 +248,18 @@ class SRCVAEModel(nn.Module):
                 - loss_components (dict): A dictionary containing the itemized values of
                                           individual loss components.
         """
-        loss_kl_u = kl_gaussian_loss(u_mean, u_logvar)
-        loss_kl_v = kl_gaussian_loss(v_mean, v_logvar)
+        if self.prior_type == 'mog':
+            u_samples = self.reparameterize(u_mean, u_logvar)
+            v_samples = self.reparameterize(v_mean, v_logvar)
+            loss_kl_u = kl_gaussian_to_mog(
+                u_samples, u_mean, u_logvar,
+                self.mog_u_means, self.mog_u_logvars, self.mog_u_logweights)
+            loss_kl_v = kl_gaussian_to_mog(
+                v_samples, v_mean, v_logvar,
+                self.mog_v_means, self.mog_v_logvars, self.mog_v_logweights)
+        else:
+            loss_kl_u = kl_gaussian_loss(u_mean, u_logvar)
+            loss_kl_v = kl_gaussian_loss(v_mean, v_logvar)
 
         # Ensure t_true and y_true have correct shapes for loss functions if they are 1D
         if t_true.ndim == 1: t_true = t_true.unsqueeze(1)
@@ -265,6 +291,25 @@ class SRCVAEModel(nn.Module):
             'loss_aux_qt': loss_aux_qt.item(), 'loss_aux_qy': loss_aux_qy.item()
         }
         return total_loss, loss_components
+
+    def _iwae_loss(self, bx, bt, by, kl_weight=1.0):
+        """Compute IWAE loss using K reparameterized samples.
+
+        log p(x) ≥ E_q[ log (1/K Σ_k w_k) ]  where
+        w_k = p(x,z_k) / q(z_k|x).
+        Approximated by averaging compute_loss across K samples.
+        """
+        K = self.n_iwae_samples
+        losses = []
+        for _ in range(K):
+            fwd = self._unpack_forward(self.forward(bx, bt, by))
+            (u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, xlv, ylv) = fwd
+            tl, _ = self.compute_loss(bx, bt, by, u_m, u_lv, v_m, v_lv,
+                                      xr, tr, yr, ta, ya, xlv, ylv,
+                                      kl_weight=kl_weight)
+            losses.append(tl.unsqueeze(0))
+        stacked = torch.cat(losses)
+        return -torch.logsumexp(-stacked, dim=0) + torch.log(torch.tensor(float(K), device=stacked.device))
 
     def _unpack_forward(self, outputs):
         """Unpack the 13-element forward output tuple."""
@@ -332,15 +377,21 @@ class SRCVAEModel(nn.Module):
             ep_acc = {k: 0.0 for k in loss_keys}
             for bx, bt, by in train_loader:
                 self.optimizer.zero_grad()
-                fwd = self._unpack_forward(self.forward(bx, bt, by))
-                (u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, xlv, ylv) = fwd
-                tl, comps = self.compute_loss(bx, bt, by, u_m, u_lv, v_m, v_lv,
-                                              xr, tr, yr, ta, ya, xlv, ylv,
-                                              kl_weight=kl_weight)
-                tl.backward()
-                self.optimizer.step()
-                for k in loss_keys:
-                    ep_acc[k] += comps[k]
+                if self.n_iwae_samples > 1:
+                    tl = self._iwae_loss(bx, bt, by, kl_weight=kl_weight)
+                    tl.backward()
+                    self.optimizer.step()
+                    ep_acc['total_loss'] += tl.item()
+                else:
+                    fwd = self._unpack_forward(self.forward(bx, bt, by))
+                    (u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, xlv, ylv) = fwd
+                    tl, comps = self.compute_loss(bx, bt, by, u_m, u_lv, v_m, v_lv,
+                                                  xr, tr, yr, ta, ya, xlv, ylv,
+                                                  kl_weight=kl_weight)
+                    tl.backward()
+                    self.optimizer.step()
+                    for k in loss_keys:
+                        ep_acc[k] += comps[k]
             nb = len(train_loader)
             for k in loss_keys:
                 history['train'][k].append(ep_acc[k] / nb)

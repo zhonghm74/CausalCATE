@@ -8,6 +8,8 @@ These include:
 - Reconstruction losses (MSE for continuous, BCE for binary variables).
 - Auxiliary prediction losses (which are aliases to reconstruction losses).
 """
+import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -46,6 +48,42 @@ def gaussian_nll_loss(y_true, y_pred_mean, y_pred_logvar):
     var = torch.exp(y_pred_logvar)
     nll = 0.5 * (y_pred_logvar + (y_true - y_pred_mean).pow(2) / (var + 1e-8))
     return nll.mean()
+
+
+def kl_gaussian_to_mog(z_samples, q_mean, q_logvar, mog_means, mog_logvars, mog_logweights):
+    """Monte Carlo KL divergence from a diagonal Gaussian q to a Mixture of Gaussians prior.
+
+    KL(q || MoG) ≈ E_q[ log q(z) - log MoG(z) ]
+
+    Args:
+        z_samples: Reparameterised samples from q, shape (B, D).
+        q_mean: Mean of q, shape (B, D).
+        q_logvar: Log-variance of q, shape (B, D).
+        mog_means: Component means, shape (K, D).
+        mog_logvars: Component log-variances, shape (K, D).
+        mog_logweights: Log mixing weights, shape (K,) (unnormalised ok,
+            will be log-softmaxed).
+
+    Returns:
+        Scalar: Batch-averaged KL divergence estimate.
+    """
+    B, D = z_samples.shape
+    K = mog_means.shape[0]
+
+    # log q(z)
+    log_q = -0.5 * (D * np.log(2 * np.pi) + q_logvar.sum(dim=1)
+                     + ((z_samples - q_mean).pow(2) / q_logvar.exp()).sum(dim=1))
+
+    # log p(z) = log Σ_k π_k N(z; μ_k, σ_k²)  via log-sum-exp
+    log_pi = torch.log_softmax(mog_logweights, dim=0)            # (K,)
+    z_exp = z_samples.unsqueeze(1)                                 # (B, 1, D)
+    mu_k = mog_means.unsqueeze(0)                                  # (1, K, D)
+    lv_k = mog_logvars.unsqueeze(0)                                # (1, K, D)
+    log_comp = -0.5 * (D * np.log(2 * np.pi) + lv_k.sum(dim=2)
+                        + ((z_exp - mu_k).pow(2) / lv_k.exp()).sum(dim=2))  # (B, K)
+    log_p = torch.logsumexp(log_pi.unsqueeze(0) + log_comp, dim=1)  # (B,)
+
+    return (log_q - log_p).mean()
 
 
 def reconstruction_mse_loss(y_true, y_pred_mean):

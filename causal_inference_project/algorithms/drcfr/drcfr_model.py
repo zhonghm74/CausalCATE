@@ -23,7 +23,8 @@ class DRCFRModel(nn.Module):
                  alpha=1.0, beta=1.0,
                  learning_rate=1e-3, weight_decay=1e-4,
                  sigmas_ipm=None, sigmas_mi=None,
-                 dropout=0.0, use_batchnorm=False):
+                 dropout=0.0, use_batchnorm=False,
+                 ipm_method='mmd', sinkhorn_eps=0.1):
         super(DRCFRModel, self).__init__()
 
         self.encoder = Encoder(input_dim, hidden_dims_phi, latent_dim_zy, latent_dim_zs,
@@ -37,6 +38,8 @@ class DRCFRModel(nn.Module):
         self.beta = beta
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.ipm_method = ipm_method
+        self.sinkhorn_eps = sinkhorn_eps
 
         self.optimizer = optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
@@ -112,9 +115,10 @@ class DRCFRModel(nn.Module):
         z_y_control = z_y[~t_f_bool]
         z_y_treated = z_y[t_f_bool]
         
-        loss_ipm = torch.tensor(0.0, device=self.device) # Default to 0 if a group is empty
-        if z_y_control.numel() > 0 and z_y_treated.numel() > 0: # MMD requires samples from both groups
-            loss_ipm = ipm_loss_zy(z_y_treated, z_y_control, self.sigmas_ipm)
+        loss_ipm = torch.tensor(0.0, device=self.device)
+        if z_y_control.numel() > 0 and z_y_treated.numel() > 0:
+            loss_ipm = ipm_loss_zy(z_y_treated, z_y_control, self.sigmas_ipm,
+                                   method=self.ipm_method, sinkhorn_eps=self.sinkhorn_eps)
         
         loss_mi = mi_loss_zs_t(z_s, t_f_bool, self.sigmas_mi) # mi_loss_zs_t handles empty z_s internally
 
