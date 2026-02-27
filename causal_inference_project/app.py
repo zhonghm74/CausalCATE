@@ -653,10 +653,10 @@ elif algo == "SRCVAE":
                 for bx, bt, by in train_dl:
                     model.optimizer.zero_grad()
                     outputs = model.forward(bx, bt, by)
-                    u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, _, _ = outputs
+                    u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, _, _, xlv, ylv = outputs
                     tl, comps = model.compute_loss(bx, bt, by,
                                                    u_m, u_lv, v_m, v_lv,
-                                                   xr, tr, yr, ta, ya)
+                                                   xr, tr, yr, ta, ya, xlv, ylv)
                     tl.backward()
                     model.optimizer.step()
                     for k in loss_keys:
@@ -670,10 +670,10 @@ elif algo == "SRCVAE":
                 with torch.no_grad():
                     for bx, bt, by in val_dl:
                         outputs = model.forward(bx, bt, by)
-                        u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, _, _ = outputs
+                        u_m, u_lv, v_m, v_lv, xr, tr, yr, ta, ya, _, _, xlv, ylv = outputs
                         _, comps = model.compute_loss(bx, bt, by,
                                                       u_m, u_lv, v_m, v_lv,
-                                                      xr, tr, yr, ta, ya)
+                                                      xr, tr, yr, ta, ya, xlv, ylv)
                         for k in loss_keys:
                             vep[k] += comps[k]
                 vnb = len(val_dl)

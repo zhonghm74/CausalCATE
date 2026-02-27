@@ -1,92 +1,40 @@
 """
 Main Model Class for MIM-DRCFR Algorithm.
 
-This module defines the `DRCFRModel` class, which orchestrates the components
-of the Mutual Information Regularized Disentangled Representation for
-Counterfactual Regression (MIM-DRCFR) algorithm. It integrates the neural
-network architectures (Encoder, PredictionHeads) and the loss functions
-to enable training and inference for causal effect estimation.
+Integrates Encoder, PredictionHeads, and regularised loss functions.
+Supports optional Dropout/BatchNorm, early stopping, LR scheduling,
+and returns structured training history.
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-# Relative imports for modules within the same package
 from .networks import Encoder, PredictionHead
 from .losses import factual_mse_loss, ipm_loss_zy, mi_loss_zs_t
 
+
 class DRCFRModel(nn.Module):
-    """
-    Mutual Information Regularized Disentangled Representation for Counterfactual Regression (MIM-DRCFR) model.
+    """MIM-DRCFR model with optional Dropout/BatchNorm, early stopping, and LR scheduling."""
 
-    This model aims to estimate Individual Treatment Effects (ITEs) by learning
-    disentangled representations of input features. It separates features into:
-    - `z_y`: A latent representation primarily influencing the outcome.
-    - `z_s`: A latent representation primarily influencing the treatment assignment mechanism.
-
-    The model consists of an Encoder, two PredictionHeads (one for control outcome Y(0),
-    one for treated outcome Y(1)), and a loss function that combines:
-    1. Factual outcome prediction error (MSE).
-    2. An Integral Probability Metric (IPM) term (MMD) to balance the distributions
-       of `z_y` between treated and control groups.
-    3. A Mutual Information (MI) minimization term (MMD-based) to reduce the
-       statistical dependency between `z_s` and the treatment assignment `t`.
-
-    Attributes:
-        encoder (Encoder): The encoder network phi(x) -> (z_y, z_s).
-        h0 (PredictionHead): Prediction head for control outcome Y(0) from z_y.
-        h1 (PredictionHead): Prediction head for treated outcome Y(1) from z_y.
-        alpha (float): Weight for the IPM loss term (L_IPM).
-        beta (float): Weight for the Mutual Information loss term (L_I).
-        optimizer (torch.optim.Optimizer): Optimizer for model parameters.
-        sigmas_ipm (list of float): RBF kernel bandwidths for the IPM MMD loss.
-        sigmas_mi (list of float): RBF kernel bandwidths for the MI MMD loss.
-        device (torch.device): The device (CPU or CUDA) the model is on.
-    """
-    def __init__(self, input_dim, 
-                 hidden_dims_phi, latent_dim_zy, latent_dim_zs, 
-                 hidden_dims_h, output_dim=1, 
-                 alpha=1.0, beta=1.0, 
+    def __init__(self, input_dim,
+                 hidden_dims_phi, latent_dim_zy, latent_dim_zs,
+                 hidden_dims_h, output_dim=1,
+                 alpha=1.0, beta=1.0,
                  learning_rate=1e-3, weight_decay=1e-4,
-                 sigmas_ipm=None, sigmas_mi=None):
-        """
-        Initializes the DRCFRModel.
-
-        Args:
-            input_dim (int): Dimensionality of the input features `x`.
-            hidden_dims_phi (list of int): List of hidden layer sizes for the shared part
-                                           of the `Encoder` network. Example: `[100, 100]`.
-            latent_dim_zy (int): Dimensionality of the latent representation `z_y` (for outcome prediction).
-            latent_dim_zs (int): Dimensionality of the latent representation `z_s` (for treatment mechanism).
-            hidden_dims_h (list of int): List of hidden layer sizes for each `PredictionHead` network.
-                                         Example: `[50, 50]`.
-            output_dim (int, optional): Dimensionality of the predicted outcome by each `PredictionHead`.
-                                        Defaults to 1 (for scalar outcomes).
-            alpha (float, optional): Weight hyperparameter for the IPM loss term (L_IPM) that balances
-                                     the `z_y` distributions. Defaults to 1.0.
-            beta (float, optional): Weight hyperparameter for the Mutual Information loss term (L_I)
-                                    that encourages independence between `z_s` and treatment `t`.
-                                    Defaults to 1.0.
-            learning_rate (float, optional): Learning rate for the Adam optimizer. Defaults to 1e-3.
-            weight_decay (float, optional): Weight decay (L2 penalty) for the Adam optimizer.
-                                            Defaults to 1e-4.
-            sigmas_ipm (list of float, optional): List of RBF kernel bandwidths to use for the
-                                                  IPM MMD loss calculation (balancing `z_y`).
-                                                  Defaults to `[0.1, 1.0, 10.0]`.
-            sigmas_mi (list of float, optional): List of RBF kernel bandwidths to use for the
-                                                 MI MMD loss calculation (independence of `z_s` and `t`).
-                                                 Defaults to `[0.1, 1.0, 10.0]`.
-        """
+                 sigmas_ipm=None, sigmas_mi=None,
+                 dropout=0.0, use_batchnorm=False):
         super(DRCFRModel, self).__init__()
 
-        self.encoder = Encoder(input_dim, hidden_dims_phi, latent_dim_zy, latent_dim_zs)
-        self.h0 = PredictionHead(latent_dim_zy, hidden_dims_h, output_dim) # For control group (t=0)
-        self.h1 = PredictionHead(latent_dim_zy, hidden_dims_h, output_dim) # For treated group (t=1)
+        self.encoder = Encoder(input_dim, hidden_dims_phi, latent_dim_zy, latent_dim_zs,
+                               dropout=dropout, use_batchnorm=use_batchnorm)
+        self.h0 = PredictionHead(latent_dim_zy, hidden_dims_h, output_dim,
+                                 dropout=dropout, use_batchnorm=use_batchnorm)
+        self.h1 = PredictionHead(latent_dim_zy, hidden_dims_h, output_dim,
+                                 dropout=dropout, use_batchnorm=use_batchnorm)
 
         self.alpha = alpha
         self.beta = beta
-        # Store learning_rate and weight_decay for reference, though optimizer is main user
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
 
@@ -94,7 +42,7 @@ class DRCFRModel(nn.Module):
 
         self.sigmas_ipm = sigmas_ipm if sigmas_ipm is not None else [0.1, 1.0, 10.0]
         self.sigmas_mi = sigmas_mi if sigmas_mi is not None else [0.1, 1.0, 10.0]
-        
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
 
@@ -174,34 +122,24 @@ class DRCFRModel(nn.Module):
         
         return total_loss, loss_r, loss_ipm, loss_mi
 
-    def fit(self, x_train, y_train, t_train, num_epochs, batch_size, 
-            x_val=None, y_val=None, t_val=None, print_every_epochs=10):
-        """
-        Trains the MIM-DRCFR model using the provided training data.
+    def fit(self, x_train, y_train, t_train, num_epochs, batch_size,
+            x_val=None, y_val=None, t_val=None, print_every_epochs=10,
+            patience=None, lr_scheduler=None):
+        """Train the model.  Returns a ``history`` dict with per-epoch losses.
 
-        Args:
-            x_train (torch.Tensor): Training features, shape (n_train_samples, input_dim).
-            y_train (torch.Tensor): Training factual outcomes, shape (n_train_samples, output_dim) or (n_train_samples,).
-            t_train (torch.Tensor): Training factual treatments (0 or 1), shape (n_train_samples,) or (n_train_samples,1).
-            num_epochs (int): Number of epochs to train for.
-            batch_size (int): Size of mini-batches for training.
-            x_val (torch.Tensor, optional): Validation features. Defaults to None.
-            y_val (torch.Tensor, optional): Validation factual outcomes. Defaults to None.
-            t_val (torch.Tensor, optional): Validation factual treatments. Defaults to None.
-            print_every_epochs (int, optional): Frequency of printing training and validation
-                                                loss statistics. Defaults to 10.
+        New optional args (backward-compatible – all default to None/off):
+            patience: Early-stopping patience (epochs without val-loss
+                improvement).  Requires validation data.  ``None`` = disabled.
+            lr_scheduler: ``'plateau'`` for ReduceLROnPlateau, ``'cosine'``
+                for CosineAnnealingLR, or ``None`` (no scheduling).
         """
-        self.train() # Set model to training mode
+        self.train()
 
-        # Move data to the model's device
         x_train = x_train.to(self.device)
         y_train = y_train.to(self.device)
         t_train = t_train.to(self.device)
-
-        # Ensure y_train and t_train have appropriate shapes for DataLoader and loss computation
         if y_train.ndim == 1: y_train = y_train.unsqueeze(1)
-        if t_train.ndim == 1: t_train = t_train.unsqueeze(1) # Will be squeezed in compute_loss if needed for bool indexing
-
+        if t_train.ndim == 1: t_train = t_train.unsqueeze(1)
 
         train_dataset = TensorDataset(x_train, y_train, t_train)
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -216,59 +154,87 @@ class DRCFRModel(nn.Module):
             val_dataset = TensorDataset(x_val, y_val, t_val)
             val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
-        for epoch in range(num_epochs):
-            epoch_total_loss = 0
-            epoch_loss_r = 0
-            epoch_loss_ipm = 0
-            epoch_loss_mi = 0
-            
-            for batch_x, batch_y, batch_t in train_loader:
-                self.optimizer.zero_grad()
-                y_pred_h0, y_pred_h1, z_y, z_s = self.forward(batch_x)
-                total_loss, loss_r, loss_ipm, loss_mi = self.compute_loss(
-                    batch_x, batch_y, batch_t, y_pred_h0, y_pred_h1, z_y, z_s
-                )
-                total_loss.backward()
-                self.optimizer.step()
+        # LR scheduler
+        scheduler = None
+        if lr_scheduler == 'plateau' and val_loader:
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.5, patience=max(1, (patience or 10) // 2))
+        elif lr_scheduler == 'cosine':
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=num_epochs)
 
-                epoch_total_loss += total_loss.item()
-                epoch_loss_r += loss_r.item()
-                epoch_loss_ipm += loss_ipm.item() 
-                epoch_loss_mi += loss_mi.item()
+        # Early stopping state
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+        best_state = None
+
+        keys = ['total', 'R', 'IPM', 'MI']
+        history = {'train': {k: [] for k in keys}, 'val': {k: [] for k in keys}}
+
+        for epoch in range(num_epochs):
+            self.train()
+            ep = {k: 0.0 for k in keys}
+            for bx, by, bt in train_loader:
+                self.optimizer.zero_grad()
+                h0, h1, zy, zs = self.forward(bx)
+                tl, lr_, li_, lm_ = self.compute_loss(bx, by, bt, h0, h1, zy, zs)
+                tl.backward()
+                self.optimizer.step()
+                ep['total'] += tl.item(); ep['R'] += lr_.item()
+                ep['IPM'] += li_.item(); ep['MI'] += lm_.item()
+            nb = len(train_loader)
+            for k in keys:
+                history['train'][k].append(ep[k] / nb)
+
+            # Validation
+            val_total = None
+            if val_loader:
+                self.eval()
+                vep = {k: 0.0 for k in keys}
+                with torch.no_grad():
+                    for bx, by, bt in val_loader:
+                        h0, h1, zy, zs = self.forward(bx)
+                        tl, lr_, li_, lm_ = self.compute_loss(bx, by, bt, h0, h1, zy, zs)
+                        vep['total'] += tl.item(); vep['R'] += lr_.item()
+                        vep['IPM'] += li_.item(); vep['MI'] += lm_.item()
+                vnb = len(val_loader)
+                for k in keys:
+                    history['val'][k].append(vep[k] / vnb)
+                val_total = vep['total'] / vnb
+
+            # Scheduler step
+            if scheduler is not None:
+                if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau) and val_total is not None:
+                    scheduler.step(val_total)
+                elif not isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step()
+
+            # Early stopping
+            if patience is not None and val_total is not None:
+                if val_total < best_val_loss - 1e-6:
+                    best_val_loss = val_total
+                    epochs_no_improve = 0
+                    best_state = {k: v.cpu().clone() for k, v in self.state_dict().items()}
+                else:
+                    epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    if best_state is not None:
+                        self.load_state_dict({k: v.to(self.device) for k, v in best_state.items()})
+                    if (epoch + 1) % print_every_epochs == 0 or True:
+                        print(f"Early stopping at epoch {epoch+1} (best val loss: {best_val_loss:.4f})")
+                    break
 
             if (epoch + 1) % print_every_epochs == 0:
-                avg_total_loss = epoch_total_loss / len(train_loader)
-                avg_loss_r = epoch_loss_r / len(train_loader)
-                avg_loss_ipm = epoch_loss_ipm / len(train_loader)
-                avg_loss_mi = epoch_loss_mi / len(train_loader)
-                print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_total_loss:.4f} "
-                      f"(R: {avg_loss_r:.4f}, IPM: {avg_loss_ipm:.4f}, MI: {avg_loss_mi:.4f})")
-
+                tr = history['train']
+                msg = (f"Epoch {epoch+1}/{num_epochs} - Train Loss: {tr['total'][-1]:.4f} "
+                       f"(R: {tr['R'][-1]:.4f}, IPM: {tr['IPM'][-1]:.4f}, MI: {tr['MI'][-1]:.4f})")
+                print(msg)
                 if val_loader:
-                    self.eval() # Set model to evaluation mode for validation
-                    val_epoch_total_loss = 0
-                    val_epoch_loss_r = 0
-                    val_epoch_loss_ipm = 0
-                    val_epoch_loss_mi = 0
-                    with torch.no_grad():
-                        for batch_x_val, batch_y_val, batch_t_val in val_loader:
-                            y_pred_h0_val, y_pred_h1_val, z_y_val, z_s_val = self.forward(batch_x_val)
-                            total_loss_val, loss_r_val, loss_ipm_val, loss_mi_val = self.compute_loss(
-                                batch_x_val, batch_y_val, batch_t_val, 
-                                y_pred_h0_val, y_pred_h1_val, z_y_val, z_s_val
-                            )
-                            val_epoch_total_loss += total_loss_val.item()
-                            val_epoch_loss_r += loss_r_val.item()
-                            val_epoch_loss_ipm += loss_ipm_val.item()
-                            val_epoch_loss_mi += loss_mi_val.item()
-                    
-                    avg_val_total_loss = val_epoch_total_loss / len(val_loader)
-                    avg_val_loss_r = val_epoch_loss_r / len(val_loader)
-                    avg_val_loss_ipm = val_epoch_loss_ipm / len(val_loader)
-                    avg_val_loss_mi = val_epoch_loss_mi / len(val_loader)
-                    print(f"Epoch {epoch+1}/{num_epochs} - Val Loss: {avg_val_total_loss:.4f} "
-                          f"(R: {avg_val_loss_r:.4f}, IPM: {avg_val_loss_ipm:.4f}, MI: {avg_val_loss_mi:.4f})")
-                    self.train() # Set back to training mode
+                    vr = history['val']
+                    msg = (f"Epoch {epoch+1}/{num_epochs} - Val Loss: {vr['total'][-1]:.4f} "
+                           f"(R: {vr['R'][-1]:.4f}, IPM: {vr['IPM'][-1]:.4f}, MI: {vr['MI'][-1]:.4f})")
+                    print(msg)
+
+        return history
 
     def predict_ite(self, x):
         """

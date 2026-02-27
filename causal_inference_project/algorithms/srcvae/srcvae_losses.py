@@ -37,6 +37,17 @@ def kl_gaussian_loss(mean, logvar):
     # Average over the batch
     return kl_div_sum_over_latents.mean()
 
+def gaussian_nll_loss(y_true, y_pred_mean, y_pred_logvar):
+    """Negative log-likelihood under a heteroscedastic Gaussian.
+
+    NLL = 0.5 * mean( logvar + (y - mu)^2 / exp(logvar) )
+    Averaged over batch and feature dims.
+    """
+    var = torch.exp(y_pred_logvar)
+    nll = 0.5 * (y_pred_logvar + (y_true - y_pred_mean).pow(2) / (var + 1e-8))
+    return nll.mean()
+
+
 def reconstruction_mse_loss(y_true, y_pred_mean):
     """
     Calculates the reconstruction loss for continuous variables using Mean Squared Error (MSE).
