@@ -23,6 +23,7 @@ from algorithms.dml.dml_auto import auto_dml
 from algorithms.dml.dml_iv import iv_dml, did_dml
 from algorithms.drcfr.drcfr_model import DRCFRModel
 from algorithms.srcvae.srcvae_model import SRCVAEModel
+from algorithms.dragonnet.dragonnet_model import DragonNetModel
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -823,6 +824,21 @@ elif algo == "IHDP Benchmark":
             srcvae_report = evaluation_report(test.ITE, srcvae_ite, test.T)
             results["SRCVAE"] = srcvae_report
 
+            # --- DragonNet ---
+            progress.progress(80, text="Training DragonNet …")
+            dragon = DragonNetModel(
+                input_dim=n_feat, hidden_dims_shared=[64, 32], hidden_dims_head=[32],
+                output_dim=1, alpha=1.0, beta=1.0, learning_rate=1e-3, dropout=0.1,
+            )
+            dragon.fit(
+                x_tr_t, yf_tr_t, t_tr_t,
+                num_epochs=drcfr_epochs, batch_size=min(128, n_ihdp),
+                print_every_epochs=9999,
+            )
+            dragon_ite = dragon.predict_ite(x_te_t).cpu().numpy().flatten()
+            dragon_report = evaluation_report(test.ITE, dragon_ite, test.T)
+            results["DragonNet"] = dragon_report
+
             progress.progress(100, text="Done!")
 
             # --- Display results ---
@@ -858,13 +874,15 @@ elif algo == "IHDP Benchmark":
             fig2 = go.Figure()
             fig2.add_trace(go.Histogram(x=test.ITE, nbinsx=40,
                 marker_color="white", opacity=0.3, name="True ITE"))
+            ite_map = {
+                "DML (DR-Learner)": dml_ite_test,
+                "MIM-DRCFR": drcfr_ite,
+                "SRCVAE": srcvae_ite,
+                "DragonNet": dragon_ite,
+            }
+            colors = [C_PRIMARY, C_SECONDARY, C_SUCCESS, C_WARNING]
             for name, color in zip(algo_names, colors):
-                if name == "DML (DR-Learner)":
-                    ite = dml_ite_test
-                elif name == "MIM-DRCFR":
-                    ite = drcfr_ite
-                else:
-                    ite = srcvae_ite
+                ite = ite_map.get(name, dml_ite_test)
                 fig2.add_trace(go.Histogram(x=ite, nbinsx=40,
                     marker_color=color, opacity=0.5, name=name))
             fig2.update_layout(barmode="overlay", title="ITE Distributions (Test Set)",
