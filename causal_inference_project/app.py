@@ -23,7 +23,9 @@ from algorithms.dml.dml_auto import auto_dml
 from algorithms.dml.dml_iv import iv_dml, did_dml
 from algorithms.drcfr.drcfr_model import DRCFRModel
 from algorithms.srcvae.srcvae_model import SRCVAEModel
+from algorithms.tarnet.tarnet_model import TARNetModel
 from algorithms.dragonnet.dragonnet_model import DragonNetModel
+from algorithms.ganite.ganite_model import GANITEModel
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -94,7 +96,7 @@ C_BG = "#0e1117"
 st.sidebar.title("Causal Inference Lab")
 algo = st.sidebar.radio(
     "Select Algorithm",
-    ["Overview", "DML", "MIM-DRCFR", "SRCVAE", "IHDP Benchmark"],
+    ["Overview", "DML", "MIM-DRCFR", "SRCVAE", "TARNet", "DragonNet", "GANITE", "IHDP Benchmark"],
     index=0,
 )
 st.sidebar.markdown("---")
@@ -737,6 +739,262 @@ elif algo == "SRCVAE":
             st.plotly_chart(fig2, use_container_width=True)
         else:
             st.info("Configure parameters on the left and click **Run SRCVAE**.")
+
+# ============================= TARNet ========================================
+elif algo == "TARNet":
+    st.title("TARNet — Treatment-Agnostic Representation Network")
+    st.markdown(
+        "Shared representation followed by two treatment-specific outcome heads. "
+        "A simpler baseline without distributional balancing (no IPM/MMD)."
+    )
+
+    col_cfg, col_res = st.columns([1, 2])
+    with col_cfg:
+        st.subheader("Data Settings")
+        n_samples = st.slider("Samples", 500, 5000, 2000, 100, key="tar_n")
+        n_features = st.slider("Features", 5, 30, 10, key="tar_f")
+        true_ate = st.number_input("True ATE baseline", value=1.5, step=0.1, key="tar_ate")
+        seed = st.number_input("Random seed", value=42, step=1, key="tar_seed")
+        st.subheader("Training")
+        epochs = st.slider("Epochs", 10, 300, 100, 10, key="tar_ep")
+        lr = st.select_slider("Learning rate", [1e-4, 5e-4, 1e-3, 5e-3], value=1e-3, key="tar_lr")
+        dropout = st.slider("Dropout", 0.0, 0.5, 0.1, 0.05, key="tar_do")
+        run_tar = st.button("Run TARNet", type="primary", use_container_width=True, key="tar_run")
+
+    with col_res:
+        if run_tar:
+            from sklearn.model_selection import train_test_split
+            progress = st.progress(0, text="Generating data …")
+            X_np, T_np, Yf_np, Y0_np, Y1_np = generate_drcfr_data(n_samples, n_features, true_ate, int(seed))
+            (X_tr, X_val, T_tr, T_val, Yf_tr, Yf_val,
+             Y0_tr, Y0_val, Y1_tr, Y1_val) = train_test_split(
+                X_np, T_np, Yf_np, Y0_np, Y1_np, test_size=0.2, random_state=123)
+
+            x_tr_t = torch.tensor(X_tr, dtype=torch.float32)
+            t_tr_t = torch.tensor(T_tr, dtype=torch.float32)
+            yf_tr_t = torch.tensor(Yf_tr, dtype=torch.float32).unsqueeze(1)
+            x_val_t = torch.tensor(X_val, dtype=torch.float32)
+            t_val_t = torch.tensor(T_val, dtype=torch.float32)
+            yf_val_t = torch.tensor(Yf_val, dtype=torch.float32).unsqueeze(1)
+
+            progress.progress(10, text="Training TARNet …")
+            model = TARNetModel(n_features, [128, 64], [32], dropout=dropout, learning_rate=lr)
+            history = model.fit(x_tr_t, yf_tr_t, t_tr_t, num_epochs=epochs,
+                                batch_size=128, x_val=x_val_t, y_val=yf_val_t, t_val=t_val_t,
+                                print_every_epochs=9999, patience=15)
+            progress.progress(90, text="Evaluating …")
+
+            ite_pred = model.predict_ite(x_val_t).cpu().numpy().flatten()
+            true_ite = Y1_val - Y0_val
+            true_ate_val = true_ite.mean()
+            est_ate = ite_pred.mean()
+            pehe_val = np.sqrt(np.mean((true_ite - ite_pred) ** 2))
+            progress.progress(100, text="Done!")
+
+            st.subheader("Results")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("True ATE", f"{true_ate_val:.4f}")
+            m2.metric("Estimated ATE", f"{est_ate:.4f}")
+            m3.metric("PEHE", f"{pehe_val:.4f}")
+
+            ep_range = list(range(1, len(history['train_loss']) + 1))
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=ep_range, y=history['train_loss'], mode="lines",
+                                     name="Train", line=dict(color=C_PRIMARY)))
+            if history['val_loss']:
+                fig.add_trace(go.Scatter(x=ep_range[:len(history['val_loss'])],
+                                         y=history['val_loss'], mode="lines",
+                                         name="Val", line=dict(color=C_SECONDARY)))
+            fig.update_layout(title="Training Loss", xaxis_title="Epoch", yaxis_title="Loss",
+                              height=350, template="plotly_dark", margin=dict(t=40, b=30))
+            st.plotly_chart(fig, use_container_width=True)
+
+            fig2 = go.Figure()
+            fig2.add_trace(go.Histogram(x=true_ite, nbinsx=50, marker_color=C_PRIMARY, opacity=0.6, name="True ITE"))
+            fig2.add_trace(go.Histogram(x=ite_pred, nbinsx=50, marker_color=C_SECONDARY, opacity=0.6, name="Predicted ITE"))
+            fig2.update_layout(barmode="overlay", title="ITE Distribution",
+                               xaxis_title="ITE", height=350, template="plotly_dark", margin=dict(t=40, b=30))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Configure parameters and click **Run TARNet**.")
+
+# ============================= DragonNet =====================================
+elif algo == "DragonNet":
+    st.title("DragonNet — Adapted Neural Network for Treatment Effects")
+    st.markdown(
+        "TARNet extended with a **propensity score head** ε(x) and "
+        "**targeted regularization** for doubly-robust-style bias correction."
+    )
+
+    col_cfg, col_res = st.columns([1, 2])
+    with col_cfg:
+        st.subheader("Data Settings")
+        n_samples = st.slider("Samples", 500, 5000, 2000, 100, key="drg_n")
+        n_features = st.slider("Features", 5, 30, 10, key="drg_f")
+        true_ate = st.number_input("True ATE baseline", value=1.5, step=0.1, key="drg_ate")
+        seed = st.number_input("Random seed", value=42, step=1, key="drg_seed")
+        st.subheader("DragonNet Settings")
+        alpha_prop = st.number_input("α (propensity weight)", value=1.0, step=0.1, min_value=0.0, key="drg_a")
+        beta_targ = st.number_input("β (targeted reg weight)", value=1.0, step=0.1, min_value=0.0, key="drg_b")
+        st.subheader("Training")
+        epochs = st.slider("Epochs", 10, 300, 100, 10, key="drg_ep")
+        lr = st.select_slider("Learning rate", [1e-4, 5e-4, 1e-3, 5e-3], value=1e-3, key="drg_lr")
+        dropout = st.slider("Dropout", 0.0, 0.5, 0.1, 0.05, key="drg_do")
+        run_drg = st.button("Run DragonNet", type="primary", use_container_width=True, key="drg_run")
+
+    with col_res:
+        if run_drg:
+            from sklearn.model_selection import train_test_split
+            progress = st.progress(0, text="Generating data …")
+            X_np, T_np, Yf_np, Y0_np, Y1_np = generate_drcfr_data(n_samples, n_features, true_ate, int(seed))
+            (X_tr, X_val, T_tr, T_val, Yf_tr, Yf_val,
+             Y0_tr, Y0_val, Y1_tr, Y1_val) = train_test_split(
+                X_np, T_np, Yf_np, Y0_np, Y1_np, test_size=0.2, random_state=123)
+
+            x_tr_t = torch.tensor(X_tr, dtype=torch.float32)
+            t_tr_t = torch.tensor(T_tr, dtype=torch.float32).unsqueeze(1)
+            yf_tr_t = torch.tensor(Yf_tr, dtype=torch.float32).unsqueeze(1)
+            x_val_t = torch.tensor(X_val, dtype=torch.float32)
+            t_val_t = torch.tensor(T_val, dtype=torch.float32).unsqueeze(1)
+            yf_val_t = torch.tensor(Yf_val, dtype=torch.float32).unsqueeze(1)
+
+            progress.progress(10, text="Training DragonNet …")
+            model = DragonNetModel(n_features, [128, 64], [32],
+                                   alpha=alpha_prop, beta=beta_targ,
+                                   dropout=dropout, learning_rate=lr)
+            history = model.fit(x_tr_t, yf_tr_t, t_tr_t, num_epochs=epochs,
+                                batch_size=128, x_val=x_val_t, y_val=yf_val_t, t_val=t_val_t,
+                                print_every_epochs=9999, patience=15)
+            progress.progress(90, text="Evaluating …")
+
+            ite_pred = model.predict_ite(x_val_t).cpu().numpy().flatten()
+            prop_pred = model.predict_propensity(x_val_t).cpu().numpy().flatten()
+            true_ite = Y1_val - Y0_val
+            true_ate_val = true_ite.mean()
+            est_ate = ite_pred.mean()
+            pehe_val = np.sqrt(np.mean((true_ite - ite_pred) ** 2))
+            progress.progress(100, text="Done!")
+
+            st.subheader("Results")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("True ATE", f"{true_ate_val:.4f}")
+            m2.metric("Estimated ATE", f"{est_ate:.4f}")
+            m3.metric("PEHE", f"{pehe_val:.4f}")
+
+            ep_range = list(range(1, len(history['train_loss']) + 1))
+            fig = make_subplots(rows=1, cols=2, subplot_titles=("Total Loss", "Component Losses"))
+            fig.add_trace(go.Scatter(x=ep_range, y=history['train_loss'], name="Train",
+                                     line=dict(color=C_PRIMARY)), row=1, col=1)
+            if history['val_loss']:
+                fig.add_trace(go.Scatter(x=ep_range[:len(history['val_loss'])],
+                                         y=history['val_loss'], name="Val",
+                                         line=dict(color=C_SECONDARY)), row=1, col=1)
+            fig.add_trace(go.Scatter(x=ep_range, y=history['train_outcome'], name="Outcome",
+                                     line=dict(color=C_SUCCESS)), row=1, col=2)
+            fig.add_trace(go.Scatter(x=ep_range, y=history['train_propensity'], name="Propensity",
+                                     line=dict(color=C_WARNING)), row=1, col=2)
+            fig.add_trace(go.Scatter(x=ep_range, y=history['train_targeted'], name="Targeted",
+                                     line=dict(color=C_SECONDARY)), row=1, col=2)
+            fig.update_layout(height=350, template="plotly_dark", margin=dict(t=40, b=30))
+            fig.update_xaxes(title_text="Epoch")
+            st.plotly_chart(fig, use_container_width=True)
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                fig2 = go.Figure()
+                fig2.add_trace(go.Histogram(x=true_ite, nbinsx=50, marker_color=C_PRIMARY, opacity=0.6, name="True ITE"))
+                fig2.add_trace(go.Histogram(x=ite_pred, nbinsx=50, marker_color=C_SECONDARY, opacity=0.6, name="Predicted ITE"))
+                fig2.update_layout(barmode="overlay", title="ITE Distribution",
+                                   xaxis_title="ITE", height=350, template="plotly_dark", margin=dict(t=40, b=30))
+                st.plotly_chart(fig2, use_container_width=True)
+            with col_b:
+                fig3 = go.Figure()
+                fig3.add_trace(go.Histogram(x=prop_pred, nbinsx=40, marker_color=C_SUCCESS, opacity=0.8, name="ε̂(x)"))
+                fig3.update_layout(title="Predicted Propensity P(T=1|X)",
+                                   xaxis_title="ε̂(x)", height=350, template="plotly_dark", margin=dict(t=40, b=30))
+                st.plotly_chart(fig3, use_container_width=True)
+        else:
+            st.info("Configure parameters and click **Run DragonNet**.")
+
+# ============================= GANITE ========================================
+elif algo == "GANITE":
+    st.title("GANITE — GAN for Individualised Treatment Effects")
+    st.markdown(
+        "Two-stage GAN: **Stage 1** trains a counterfactual generator + discriminator, "
+        "**Stage 2** trains an ITE predictor on the generator's pseudo-outcomes."
+    )
+
+    col_cfg, col_res = st.columns([1, 2])
+    with col_cfg:
+        st.subheader("Data Settings")
+        n_samples = st.slider("Samples", 500, 5000, 2000, 100, key="gan_n")
+        n_features = st.slider("Features", 5, 30, 10, key="gan_f")
+        true_ate = st.number_input("True ATE baseline", value=1.5, step=0.1, key="gan_ate")
+        seed = st.number_input("Random seed", value=42, step=1, key="gan_seed")
+        st.subheader("GANITE Settings")
+        noise_dim = st.slider("Noise dim (z)", 2, 32, 8, key="gan_z")
+        st.subheader("Training")
+        epochs = st.slider("Total epochs (split S1/S2)", 10, 200, 60, 10, key="gan_ep")
+        lr = st.select_slider("Learning rate", [1e-4, 5e-4, 1e-3, 5e-3], value=1e-3, key="gan_lr")
+        run_gan = st.button("Run GANITE", type="primary", use_container_width=True, key="gan_run")
+
+    with col_res:
+        if run_gan:
+            from sklearn.model_selection import train_test_split
+            progress = st.progress(0, text="Generating data …")
+            X_np, T_np, Yf_np, Y0_np, Y1_np = generate_drcfr_data(n_samples, n_features, true_ate, int(seed))
+            (X_tr, X_val, T_tr, T_val, Yf_tr, Yf_val,
+             Y0_tr, Y0_val, Y1_tr, Y1_val) = train_test_split(
+                X_np, T_np, Yf_np, Y0_np, Y1_np, test_size=0.2, random_state=123)
+
+            x_tr_t = torch.tensor(X_tr, dtype=torch.float32)
+            t_tr_t = torch.tensor(T_tr, dtype=torch.float32).unsqueeze(1)
+            yf_tr_t = torch.tensor(Yf_tr, dtype=torch.float32).unsqueeze(1)
+            x_val_t = torch.tensor(X_val, dtype=torch.float32)
+
+            progress.progress(10, text="Training GANITE (Stage 1 + 2) …")
+            model = GANITEModel(n_features, hidden_dims=[64, 32], noise_dim=noise_dim, learning_rate=lr)
+            history = model.fit(x_tr_t, yf_tr_t, t_tr_t, num_epochs=epochs,
+                                batch_size=128, print_every_epochs=9999)
+            progress.progress(90, text="Evaluating …")
+
+            ite_pred = model.predict_ite(x_val_t).cpu().numpy().flatten()
+            true_ite = Y1_val - Y0_val
+            true_ate_val = true_ite.mean()
+            est_ate = ite_pred.mean()
+            pehe_val = np.sqrt(np.mean((true_ite - ite_pred) ** 2))
+            progress.progress(100, text="Done!")
+
+            st.subheader("Results")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("True ATE", f"{true_ate_val:.4f}")
+            m2.metric("Estimated ATE", f"{est_ate:.4f}")
+            m3.metric("PEHE", f"{pehe_val:.4f}")
+
+            fig = make_subplots(rows=1, cols=2, subplot_titles=("Stage 1: G & D Loss", "Stage 2: ITE Predictor Loss"))
+            if history['g_loss']:
+                s1_range = list(range(1, len(history['g_loss']) + 1))
+                fig.add_trace(go.Scatter(x=s1_range, y=history['g_loss'], name="Generator",
+                                         line=dict(color=C_PRIMARY)), row=1, col=1)
+                fig.add_trace(go.Scatter(x=s1_range, y=history['d_loss'], name="Discriminator",
+                                         line=dict(color=C_SECONDARY)), row=1, col=1)
+            if history['i_loss']:
+                s2_range = list(range(1, len(history['i_loss']) + 1))
+                fig.add_trace(go.Scatter(x=s2_range, y=history['i_loss'], name="ITE Predictor",
+                                         line=dict(color=C_SUCCESS)), row=1, col=2)
+            fig.update_layout(height=350, template="plotly_dark", margin=dict(t=40, b=30))
+            fig.update_xaxes(title_text="Epoch")
+            fig.update_yaxes(title_text="Loss")
+            st.plotly_chart(fig, use_container_width=True)
+
+            fig2 = go.Figure()
+            fig2.add_trace(go.Histogram(x=true_ite, nbinsx=50, marker_color=C_PRIMARY, opacity=0.6, name="True ITE"))
+            fig2.add_trace(go.Histogram(x=ite_pred, nbinsx=50, marker_color=C_SECONDARY, opacity=0.6, name="Predicted ITE"))
+            fig2.update_layout(barmode="overlay", title="ITE Distribution",
+                               xaxis_title="ITE", height=350, template="plotly_dark", margin=dict(t=40, b=30))
+            st.plotly_chart(fig2, use_container_width=True)
+        else:
+            st.info("Configure parameters and click **Run GANITE**.")
 
 # ============================= IHDP BENCHMARK ================================
 elif algo == "IHDP Benchmark":
